@@ -1,11 +1,7 @@
 #include "Inspector.h"
 #include "ImGuiPresenter.h"
 #include "axmol.h"
-
-#if __has_include(<cxxabi.h>)
-#    define AX_HAS_CXXABI 1
-#    include <cxxabi.h>
-#endif
+#include "base/NodeReflection.h"
 
 #include "fmt/format.h"
 #include <memory>
@@ -213,38 +209,18 @@ void Inspector::cleanup()
     _afterNewSceneEventListener = nullptr;
 }
 
-#if AX_TARGET_PLATFORM == AX_PLATFORM_WIN32
+// demangle/getNodeTypeName have moved to ax::NodeReflection (core/base/NodeReflection.h,cpp) so
+// headless tooling can share them without linking ImGui. These statics delegate so existing
+// callers of Inspector::demangle/getNodeTypeName keep compiling unchanged.
 
-std::string Inspector::demangle(const char* name)
+std::string Inspector::demangle(const char* mangled)
 {
-    // works because msvc's typeid().name() returns undecorated name
-    // typeid(Node).name() == "class ax::Node"
-    // the + 6 gets rid of the class prefix
-    // "class ax::Node" + 6 == "ax::Node"
-    return { name + 6 };
+    return NodeReflection::demangle(mangled);
 }
-
-#elif AX_HAS_CXXABI
-
-std::string Inspector::demangle(const char* mangled_name)
-{
-    int status = -4;
-    std::unique_ptr<char, void (*)(void*)> res{abi::__cxa_demangle(mangled_name, nullptr, nullptr, &status), std::free};
-    return (status == 0) ? res.get() : mangled_name;
-}
-
-#else
-
-std::string Inspector::demangle(const char* name)
-{
-    return { name };
-}
-
-#endif
 
 std::string Inspector::getNodeTypeName(Node* node)
 {
-    return demangle(typeid(*node).name());
+    return NodeReflection::getTypeName(node);
 }
 
 void Inspector::drawTreeRecursive(Node* node, int index)

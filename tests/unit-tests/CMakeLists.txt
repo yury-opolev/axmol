@@ -37,6 +37,7 @@ set(GAME_SOURCE
     Source/core/2d/NodeTests.cpp
 
     Source/core/base/MapTests.cpp
+    Source/core/base/NodeReflectionTests.cpp
     Source/core/base/UTF8Tests.cpp
     Source/core/base/UtilsTests.cpp
     Source/core/base/ValueTests.cpp
