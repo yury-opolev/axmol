@@ -31,9 +31,11 @@
 #    include <cxxabi.h>
 #endif
 
+#include "2d/Label.h"
 #include "2d/Node.h"
 #include "2d/Sprite.h"
 #include "base/Protocols.h"
+#include "platform/FileUtils.h"
 #include "fmt/format.h"
 
 #include <algorithm>
@@ -211,6 +213,58 @@ public:
 
 /// Sprite-only properties. texturePath is deliberately read-only: a live Sprite's texture is
 /// set through Sprite::setTexture()/initWithFile(), not through a bare path string.
+/// Turns an absolute, already-resolved asset path back into the resource-relative name that would
+/// find it again.
+///
+/// WHY THIS IS NEEDED. Texture2D::getPath() returns what Image stored, and Image sets it from
+/// FileUtils::fullPathForFilename() - i.e. the FULLY RESOLVED path on this machine, not the name
+/// the caller passed to Sprite::create(). Reporting that verbatim would be merely ugly for an
+/// inspector, but "texturePath" is also what SceneSerializer records so a sprite can be rebuilt:
+/// a scene file carrying "C:/Users/someone/.../Content/hero.png" is committed to the repository
+/// and then fails to load on every other machine, on Android, and in any packaged build. Stripping
+/// the resource roots restores "hero.png", which is portable and is what the file should say.
+std::string asResourceRelativePath(std::string_view absolute)
+{
+    std::string path(absolute);
+    if (path.empty())
+        return path;
+
+    // Compare on forward slashes: the search paths and the resolved path can disagree about
+    // separators on Windows.
+    auto normalise = [](std::string text) {
+        std::replace(text.begin(), text.end(), '\\', '/');
+        return text;
+    };
+    path = normalise(std::move(path));
+
+    auto* fileUtils = FileUtils::getInstance();
+
+    // Longest prefix wins: search paths are often nested under the resource root, and stripping
+    // the shorter one first would leave a stray directory component behind.
+    std::string bestPrefix;
+    auto consider = [&](std::string_view candidate) {
+        if (candidate.empty())
+            return;
+        std::string prefix = normalise(std::string(candidate));
+        if (prefix.back() != '/')
+            prefix += '/';
+        if (path.size() > prefix.size() && path.compare(0, prefix.size(), prefix) == 0 &&
+            prefix.size() > bestPrefix.size())
+            bestPrefix = std::move(prefix);
+    };
+
+    for (const auto& searchPath : fileUtils->getSearchPaths())
+        consider(searchPath);
+    for (const auto& searchPath : fileUtils->getOriginalSearchPaths())
+        consider(searchPath);
+    consider(fileUtils->getDefaultResourceRootPath());
+    consider(fileUtils->getWritablePath());
+
+    if (!bestPrefix.empty())
+        path.erase(0, bestPrefix.size());
+    return path;
+}
+
 class SpritePropertyProvider : public PropertyProvider
 {
 public:
@@ -238,7 +292,7 @@ public:
         else if (name == "texturePath")
         {
             auto* texture = sprite->getTexture();
-            out           = texture ? texture->getPath() : std::string();
+            out           = texture ? asResourceRelativePath(texture->getPath()) : std::string();
         }
         else
             return false;
@@ -277,16 +331,49 @@ class LabelPropertyProvider : public PropertyProvider
 public:
     bool supports(Node* node) const override { return dynamic_cast<LabelProtocol*>(node) != nullptr; }
 
-    std::vector<PropertyInfo> list() const override { return {{"text", PropertyType::String, true}}; }
+    std::vector<PropertyInfo> list() const override
+    {
+        return {
+            {"text", PropertyType::String, true},
+            // Read-only, and reported for ax::Label only (see get()). A label's font is fixed at
+            // construction - Label::createWithSystemFont / createWithTTF - so these exist to be
+            // READ BACK: they are exactly what NodeFactory needs to rebuild the label, and
+            // without them a serialized label reloads in the platform default font.
+            {"fontName", PropertyType::String, false},
+            {"fontSize", PropertyType::Float, false},
+        };
+    }
 
     bool get(Node* node, std::string_view name, PropertyValue& out) const override
     {
         auto* label = dynamic_cast<LabelProtocol*>(node);
-        if (!label || name != "text")
+        if (!label)
             return false;
 
-        out = std::string(label->getString());
-        return true;
+        if (name == "text")
+        {
+            out = std::string(label->getString());
+            return true;
+        }
+
+        // The font accessors live on ax::Label, not on the LabelProtocol this provider supports
+        // broadly, so anything else (LabelAtlas, LabelBMFont) simply does not expose them.
+        auto* concrete = dynamic_cast<Label*>(node);
+        if (!concrete)
+            return false;
+
+        const bool isTTF = concrete->getLabelType() == Label::LabelType::TTF;
+        if (name == "fontName")
+        {
+            out = isTTF ? concrete->getTTFConfig().fontFilePath : std::string(concrete->getSystemFontName());
+            return true;
+        }
+        if (name == "fontSize")
+        {
+            out = isTTF ? concrete->getTTFConfig().fontSize : concrete->getSystemFontSize();
+            return true;
+        }
+        return false;
     }
 
     bool set(Node* node, std::string_view name, const PropertyValue& value) const override

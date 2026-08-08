@@ -27,10 +27,12 @@
 #include "base/AgentRequestHandler.h"
 #include "base/NodeReflection.h"
 #include "base/SceneAccess.h"
+#include "2d/ActionInterval.h"
 #include "2d/Node.h"
 
 #include "rapidjson/document.h"
 
+#include <map>
 #include <memory>
 #include <string>
 
@@ -102,6 +104,39 @@ public:
         swipeY1     = y1;
         swipeX2     = x2;
         swipeY2     = y2;
+    }
+
+    // In-memory stand-in for the writable path, so scene.save/load can be exercised with no
+    // filesystem at all.
+    std::map<std::string, std::string> files;
+    bool writeShouldFail   = false;
+    std::string writeError = "disk full";
+    std::string lastWrittenFile;
+
+    bool writeTextFile(std::string_view file, std::string_view contents, std::string& outPath,
+                       std::string& outError) override
+    {
+        lastWrittenFile = std::string(file);
+        if (writeShouldFail)
+        {
+            outError = writeError;
+            return false;
+        }
+        files[std::string(file)] = std::string(contents);
+        outPath                  = "/writable/" + std::string(file);
+        return true;
+    }
+
+    bool readTextFile(std::string_view file, std::string& outContents, std::string& outError) override
+    {
+        const auto it = files.find(std::string(file));
+        if (it == files.end())
+        {
+            outError = "no such file: " + std::string(file);
+            return false;
+        }
+        outContents = it->second;
+        return true;
     }
 
     void setPaused(bool p) override { paused = p; }
@@ -684,5 +719,425 @@ TEST_SUITE("core/base/AgentRequestHandler")
             sendRequest(handler, R"({"id":2,"method":"node.set","params":{"path":"/0","name":"visible","value":true}})");
         REQUIRE_FALSE(setDoc["ok"].GetBool());
         CHECK_EQ(std::string("no_scene"), std::string(setDoc["error"]["code"].GetString()));
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Node lifecycle and persistence (Stage 5).
+    // ------------------------------------------------------------------------------------------
+
+    TEST_CASE("node_create_adds_a_child_and_reports_its_path")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        const auto before = f.root->getChildrenCount();
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler,
+                               R"({"id":1,"method":"node.create","params":{"parentPath":"/","type":"ax::Node"}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(f.root->getChildrenCount() == before + 1);
+        // The caller needs the path to address what it just made.
+        CHECK(std::string(doc["result"]["path"].GetString()).rfind("/", 0) == 0);
+    }
+
+    TEST_CASE("node_create_applies_initial_properties")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.create","params":{
+            "parentPath":"/","type":"ax::Node","props":{"name":"made","tag":42}}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        auto* created = NodeReflection::getInstance()->resolve(f.root, doc["result"]["path"].GetString());
+        REQUIRE(created != nullptr);
+        CHECK(created->getName() == "made");
+        CHECK(created->getTag() == 42);
+    }
+
+    TEST_CASE("node_create_rejects_a_bad_property_without_attaching_anything")
+    {
+        // A half-created node left in the scene would be worse than the failure itself.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        const auto before = f.root->getChildrenCount();
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.create","params":{
+            "parentPath":"/","type":"ax::Node","props":{"visible":"not a bool"}}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("type_mismatch"), std::string(doc["error"]["code"].GetString()));
+        CHECK(f.root->getChildrenCount() == before);
+    }
+
+    TEST_CASE("node_create_reports_an_unknown_type_distinctly")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler,
+                               R"({"id":1,"method":"node.create","params":{"parentPath":"/","type":"ax::Nope"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("unknown_type"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("node_create_requires_parent_and_type")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.create","params":{"type":"ax::Node"}})");
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("node_delete_removes_the_node")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        const auto before = f.root->getChildrenCount();
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.delete","params":{"path":"/0"}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(f.root->getChildrenCount() == before - 1);
+    }
+
+    TEST_CASE("node_delete_refuses_the_running_scene")
+    {
+        // Deleting the scene out from under the Director is a crash, not an edit.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.delete","params":{"path":"/"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+        CHECK(access.scene != nullptr);
+    }
+
+    TEST_CASE("node_reparent_moves_a_node_and_reports_its_new_path")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto* moved  = NodeReflection::getInstance()->resolve(f.root, "/0");
+        auto* target = NodeReflection::getInstance()->resolve(f.root, "/1");
+        REQUIRE(moved != nullptr);
+        REQUIRE(target != nullptr);
+
+        auto doc = sendRequest(handler,
+                               R"({"id":1,"method":"node.reparent","params":{"path":"/0","toPath":"/1"}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(moved->getParent() == target);
+        // The path it had going in no longer addresses it.
+        CHECK(std::string(doc["result"]["path"].GetString()) != "/0");
+    }
+
+    TEST_CASE("node_reparent_refuses_to_put_a_node_beneath_itself")
+    {
+        // The cycle would detach the branch from the scene and leak it.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto* parent = NodeReflection::getInstance()->resolve(f.root, "/0");
+        REQUIRE(parent != nullptr);
+        auto* child = Node::create();
+        parent->addChild(child);
+
+        const std::string childPath = NodeReflection::getInstance()->pathOf(f.root, child);
+        const auto request = std::string(R"({"id":1,"method":"node.reparent","params":{"path":"/0","toPath":")") +
+                             childPath + R"("}})";
+
+        auto doc = sendRequest(handler, request);
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+        CHECK(parent->getParent() == f.root);
+    }
+
+    TEST_CASE("node_reparent_keeps_the_moved_subtree_running")
+    {
+        // removeFromParent() is removeFromParentAndCleanup(TRUE), which stops every action and
+        // scheduled callback on the node and all its descendants. Moving a node is not deleting
+        // it: an agent reparenting an animating sprite would otherwise get a successful response
+        // and a silently frozen sprite.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto* moved = NodeReflection::getInstance()->resolve(f.root, "/0");
+        REQUIRE(moved != nullptr);
+        moved->runAction(RepeatForever::create(RotateBy::create(1.0f, 90.0f)));
+        REQUIRE(moved->getNumberOfRunningActions() == 1);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"node.reparent","params":{"path":"/0","toPath":"/1"}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(moved->getNumberOfRunningActions() == 1);
+    }
+
+    TEST_CASE("node_reparent_refuses_a_node_as_its_own_parent")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler,
+                               R"({"id":1,"method":"node.reparent","params":{"path":"/0","toPath":"/0"}})");
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("scene_types_lists_what_can_be_created")
+    {
+        FakeSceneAccess access;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.types"})");
+
+        REQUIRE(doc["ok"].GetBool());
+        REQUIRE(doc["result"].IsArray());
+        CHECK(doc["result"].Size() >= 4);
+
+        bool foundSprite = false;
+        for (auto& entry : doc["result"].GetArray())
+        {
+            if (std::string(entry["type"].GetString()) == "ax::Sprite")
+            {
+                foundSprite = true;
+                REQUIRE(entry["createParams"].IsArray());
+                REQUIRE(entry["createParams"].Size() == 1);
+                CHECK(std::string(entry["createParams"][0].GetString()) == "texturePath");
+            }
+        }
+        CHECK(foundSprite);
+    }
+
+    TEST_CASE("scene_save_writes_a_scene_file")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.save","params":{"file":"level.scene.json"}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(access.lastWrittenFile == "level.scene.json");
+        REQUIRE(access.files.count("level.scene.json") == 1);
+        CHECK(access.files["level.scene.json"].find("axmol-scene") != std::string::npos);
+        CHECK(doc["result"]["bytes"].GetInt() > 0);
+    }
+
+    TEST_CASE("scene_save_refuses_a_path_that_escapes_the_sandbox")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        for (const char* file : {"../evil.json", "/etc/passwd", "C:/evil.json", "sub/../../x.json"})
+        {
+            const auto request =
+                std::string(R"({"id":1,"method":"scene.save","params":{"file":")") + file + R"("}})";
+            auto doc = sendRequest(handler, request);
+            INFO("file: " << file);
+            REQUIRE_FALSE(doc["ok"].GetBool());
+            CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+        }
+        CHECK(access.files.empty());
+    }
+
+    TEST_CASE("scene_save_reports_a_write_failure")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        access.writeShouldFail = true;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.save","params":{"file":"x.json"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("internal_error"), std::string(doc["error"]["code"].GetString()));
+        CHECK(std::string(doc["error"]["message"].GetString()).find("disk full") != std::string::npos);
+    }
+
+    TEST_CASE("scene_save_then_load_round_trips_through_the_bridge")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto saved = sendRequest(handler, R"({"id":1,"method":"scene.save","params":{"file":"r.json","path":"/0"}})");
+        REQUIRE(saved["ok"].GetBool());
+
+        const auto before = f.root->getChildrenCount();
+        auto loaded = sendRequest(handler, R"({"id":2,"method":"scene.load","params":{"file":"r.json"}})");
+
+        REQUIRE(loaded["ok"].GetBool());
+        CHECK(f.root->getChildrenCount() == before + 1);
+        REQUIRE(loaded["result"]["warnings"].IsArray());
+        CHECK(loaded["result"]["warnings"].Size() == 0);
+    }
+
+    TEST_CASE("scene_load_replaces_children_only_when_asked")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        REQUIRE(sendRequest(handler, R"({"id":1,"method":"scene.save","params":{"file":"r.json","path":"/0"}})")
+                    ["ok"].GetBool());
+
+        auto doc = sendRequest(handler,
+                               R"({"id":2,"method":"scene.load","params":{"file":"r.json","replace":true}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        // Everything that was there is gone, replaced by exactly the loaded tree.
+        CHECK(f.root->getChildrenCount() == 1);
+    }
+
+    TEST_CASE("scene_load_reports_a_missing_file")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.load","params":{"file":"nope.json"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_path"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("scene_load_leaves_the_scene_untouched_when_the_file_is_bad")
+    {
+        // A failed load must not leave the scene half-replaced - which is exactly what would
+        // happen if `replace` cleared the children before the tree was known to be buildable.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        access.files["bad.json"] = R"({"format":"axmol-scene","version":1,"root":{"type":"ax::NoSuchType"}})";
+        const auto before        = f.root->getChildrenCount();
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler,
+                               R"({"id":1,"method":"scene.load","params":{"file":"bad.json","replace":true}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK(f.root->getChildrenCount() == before);
+    }
+
+    TEST_CASE("scene_load_surfaces_degradation_warnings")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        access.files["degraded.json"] =
+            R"({"format":"axmol-scene","version":1,"root":{"type":"game::Mystery","props":{"name":"kept"}}})";
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(
+            handler, R"({"id":1,"method":"scene.load","params":{"file":"degraded.json","allowDegraded":true}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        REQUIRE(doc["result"]["warnings"].IsArray());
+        REQUIRE(doc["result"]["warnings"].Size() == 1);
+        CHECK(std::string(doc["result"]["warnings"][0].GetString()).find("game::Mystery") != std::string::npos);
+    }
+
+    TEST_CASE("scene_load_contents_mode_keeps_the_target_and_adds_the_children")
+    {
+        // The whole-scene case: the saved root is the game's own Scene subclass, which no factory
+        // can rebuild, so "load this scene" means repopulating the running one.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        access.files["scene.json"] =
+            R"({"format":"axmol-scene","version":1,"root":{"type":"game::MainScene","children":[
+                {"type":"ax::Node","props":{"name":"loadedA"}},
+                {"type":"ax::Node","props":{"name":"loadedB"}}
+            ]}})";
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(
+            handler, R"({"id":1,"method":"scene.load","params":{"file":"scene.json","mode":"contents","replace":true}})");
+
+        REQUIRE(doc["ok"].GetBool());
+        CHECK(doc["result"]["nodesAdded"].GetInt() == 2);
+        CHECK(f.root->getChildrenCount() == 2);
+        CHECK(f.root->getChildren().at(0)->getName() == "loadedA");
+    }
+
+    TEST_CASE("scene_load_child_mode_still_refuses_an_unbuildable_root")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        access.files["scene.json"] =
+            R"({"format":"axmol-scene","version":1,"root":{"type":"game::MainScene","children":[]}})";
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.load","params":{"file":"scene.json"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK(std::string(doc["error"]["message"].GetString()).find("game::MainScene") != std::string::npos);
+    }
+
+    TEST_CASE("scene_load_rejects_an_unknown_mode")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        auto doc =
+            sendRequest(handler, R"({"id":1,"method":"scene.load","params":{"file":"x.json","mode":"sideways"}})");
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("scene_load_validates_its_optional_flags")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene = f.root;
+        AgentRequestHandler handler(&access);
+
+        for (const char* params : {R"({"file":"x.json","replace":"yes"})", R"({"file":"x.json","allowDegraded":1})",
+                                   R"({"file":"x.json","parentPath":7})"})
+        {
+            const auto request = std::string(R"({"id":1,"method":"scene.load","params":)") + params + "}";
+            auto doc           = sendRequest(handler, request);
+            INFO("params: " << params);
+            REQUIRE_FALSE(doc["ok"].GetBool());
+            CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+        }
     }
 }

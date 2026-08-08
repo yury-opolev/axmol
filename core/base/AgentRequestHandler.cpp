@@ -24,6 +24,7 @@
 
 #include "base/AgentRequestHandler.h"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 #include <string>
@@ -31,7 +32,14 @@
 #include <type_traits>
 #include <variant>
 
+#include "2d/Node.h"
+#include "base/NodeFactory.h"
 #include "base/NodeReflection.h"
+#include "base/SceneSerializer.h"
+// The JSON <-> PropertyValue codec lives in PropertyJson so that this bridge and SceneSerializer
+// share exactly one encoding: written twice, the wire format and the scene-file format would
+// drift, and a scene would round-trip differently depending on which door it came through.
+#include "base/PropertyJson.h"
 #include "base/SceneAccess.h"
 #include "math/Color.h"
 #include "math/Vec2.h"
@@ -47,233 +55,6 @@ namespace ax
 
 namespace
 {
-
-// -------------------------------------------------------------------------------------------
-// Small helpers around rapidjson: building strings/points/colors, and the JSON <-> PropertyValue
-// codec described in the design doc §4 ("node.set value encoding mirrors PropertyType").
-// -------------------------------------------------------------------------------------------
-
-rapidjson::Value jsonString(std::string_view s, rapidjson::Document::AllocatorType& allocator)
-{
-    rapidjson::Value v;
-    v.SetString(s.data(), static_cast<rapidjson::SizeType>(s.size()), allocator);
-    return v;
-}
-
-rapidjson::Value vec2ToJson(const Vec2& v, rapidjson::Document::AllocatorType& allocator)
-{
-    rapidjson::Value obj(rapidjson::kObjectType);
-    obj.AddMember("x", v.x, allocator);
-    obj.AddMember("y", v.y, allocator);
-    return obj;
-}
-
-rapidjson::Value vec3ToJson(const Vec3& v, rapidjson::Document::AllocatorType& allocator)
-{
-    rapidjson::Value obj(rapidjson::kObjectType);
-    obj.AddMember("x", v.x, allocator);
-    obj.AddMember("y", v.y, allocator);
-    obj.AddMember("z", v.z, allocator);
-    return obj;
-}
-
-rapidjson::Value colorToJson(const Color4B& c, rapidjson::Document::AllocatorType& allocator)
-{
-    rapidjson::Value obj(rapidjson::kObjectType);
-    obj.AddMember("r", static_cast<int>(c.r), allocator);
-    obj.AddMember("g", static_cast<int>(c.g), allocator);
-    obj.AddMember("b", static_cast<int>(c.b), allocator);
-    obj.AddMember("a", static_cast<int>(c.a), allocator);
-    return obj;
-}
-
-/// Reads {"x":..,"y":..} into `out`. Every member must be present and a JSON number - anything
-/// else (missing member, string, object, ...) is a type mismatch, never coerced.
-bool vec2FromJson(const rapidjson::Value& json, Vec2& out)
-{
-    if (!json.IsObject())
-        return false;
-    auto x = json.FindMember("x");
-    auto y = json.FindMember("y");
-    if (x == json.MemberEnd() || y == json.MemberEnd() || !x->value.IsNumber() || !y->value.IsNumber())
-        return false;
-    out = Vec2(x->value.GetFloat(), y->value.GetFloat());
-    return true;
-}
-
-bool vec3FromJson(const rapidjson::Value& json, Vec3& out)
-{
-    if (!json.IsObject())
-        return false;
-    auto x = json.FindMember("x");
-    auto y = json.FindMember("y");
-    auto z = json.FindMember("z");
-    if (x == json.MemberEnd() || y == json.MemberEnd() || z == json.MemberEnd() || !x->value.IsNumber() ||
-        !y->value.IsNumber() || !z->value.IsNumber())
-        return false;
-    out = Vec3(x->value.GetFloat(), y->value.GetFloat(), z->value.GetFloat());
-    return true;
-}
-
-/// Reads {"r":..,"g":..,"b":..,"a":..} into `out`. Every channel must be present and an integer
-/// in [0,255] - the same range Color4B's uint8_t channels can hold; anything else is rejected
-/// rather than clamped or truncated.
-bool colorFromJson(const rapidjson::Value& json, Color4B& out)
-{
-    if (!json.IsObject())
-        return false;
-    auto r = json.FindMember("r");
-    auto g = json.FindMember("g");
-    auto b = json.FindMember("b");
-    auto a = json.FindMember("a");
-    if (r == json.MemberEnd() || g == json.MemberEnd() || b == json.MemberEnd() || a == json.MemberEnd())
-        return false;
-
-    auto channel = [](const rapidjson::Value& v, uint8_t& outChannel) {
-        if (!v.IsInt())
-            return false;
-        const int n = v.GetInt();
-        if (n < 0 || n > 255)
-            return false;
-        outChannel = static_cast<uint8_t>(n);
-        return true;
-    };
-
-    return channel(r->value, out.r) && channel(g->value, out.g) && channel(b->value, out.b) &&
-           channel(a->value, out.a);
-}
-
-const char* propertyTypeName(PropertyType type)
-{
-    switch (type)
-    {
-    case PropertyType::Bool:
-        return "bool";
-    case PropertyType::Int:
-        return "int";
-    case PropertyType::Float:
-        return "float";
-    case PropertyType::String:
-        return "string";
-    case PropertyType::Vec2:
-        return "vec2";
-    case PropertyType::Vec3:
-        return "vec3";
-    case PropertyType::Color:
-        return "color";
-    }
-    return "unknown";
-}
-
-/// The PropertyType of whichever alternative `value` currently holds. PropertyValue's
-/// alternatives mirror PropertyType 1:1 (see the comment on PropertyType in NodeReflection.h),
-/// so this is a straight mapping rather than a lookup.
-PropertyType propertyTypeOfValue(const PropertyValue& value)
-{
-    return std::visit(
-        [](auto&& v) -> PropertyType {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, bool>)
-                return PropertyType::Bool;
-            else if constexpr (std::is_same_v<T, int>)
-                return PropertyType::Int;
-            else if constexpr (std::is_same_v<T, float>)
-                return PropertyType::Float;
-            else if constexpr (std::is_same_v<T, std::string>)
-                return PropertyType::String;
-            else if constexpr (std::is_same_v<T, Vec2>)
-                return PropertyType::Vec2;
-            else if constexpr (std::is_same_v<T, Vec3>)
-                return PropertyType::Vec3;
-            else
-                return PropertyType::Color;
-        },
-        value);
-}
-
-rapidjson::Value encodePropertyValue(const PropertyValue& value, rapidjson::Document::AllocatorType& allocator)
-{
-    return std::visit(
-        [&](auto&& v) -> rapidjson::Value {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, bool> || std::is_same_v<T, int> || std::is_same_v<T, float>)
-                return rapidjson::Value(v);
-            else if constexpr (std::is_same_v<T, std::string>)
-                return jsonString(v, allocator);
-            else if constexpr (std::is_same_v<T, Vec2>)
-                return vec2ToJson(v, allocator);
-            else if constexpr (std::is_same_v<T, Vec3>)
-                return vec3ToJson(v, allocator);
-            else
-                return colorToJson(v, allocator);
-        },
-        value);
-}
-
-/// Decodes `json` into `out` according to `type`, the property's declared PropertyType. Returns
-/// false - a type_mismatch to the caller - if `json`'s shape doesn't match `type` exactly; see
-/// the design doc §4: "A number supplied for a Bool, or a string for a Vec2, is a type_mismatch
-/// - never coerced." Int specifically requires a JSON integer literal (not e.g. 3.0) for the
-/// same reason: silently truncating a double would itself be a coercion.
-bool decodePropertyValue(const rapidjson::Value& json, PropertyType type, PropertyValue& out)
-{
-    switch (type)
-    {
-    case PropertyType::Bool:
-        if (!json.IsBool())
-            return false;
-        out = json.GetBool();
-        return true;
-    case PropertyType::Int:
-        if (!json.IsInt())
-            return false;
-        out = json.GetInt();
-        return true;
-    case PropertyType::Float:
-        if (!json.IsNumber())
-            return false;
-        out = json.GetFloat();
-        // A JSON number magnitude beyond FLT_MAX becomes +-Infinity through GetFloat(), and NaN
-        // cannot be spelled in JSON at all but rapidjson does not itself forbid a caller from
-        // constructing one - reject both here rather than let a non-finite value reach a node
-        // property (and, transitively, anything that property drives - see the identical
-        // rationale on getRequiredNumber() below, written for the same class of bug found via
-        // input.swipe).
-        if (!std::isfinite(std::get<float>(out)))
-            return false;
-        return true;
-    case PropertyType::String:
-        if (!json.IsString())
-            return false;
-        out = std::string(json.GetString(), json.GetStringLength());
-        return true;
-    case PropertyType::Vec2:
-    {
-        Vec2 v;
-        if (!vec2FromJson(json, v))
-            return false;
-        out = v;
-        return true;
-    }
-    case PropertyType::Vec3:
-    {
-        Vec3 v;
-        if (!vec3FromJson(json, v))
-            return false;
-        out = v;
-        return true;
-    }
-    case PropertyType::Color:
-    {
-        Color4B c;
-        if (!colorFromJson(json, c))
-            return false;
-        out = c;
-        return true;
-    }
-    }
-    return false;
-}
 
 rapidjson::Value nodeInfoToJson(const NodeInfo& info, rapidjson::Document::AllocatorType& allocator)
 {
@@ -728,6 +509,457 @@ bool handleScreenshot(SceneAccess* access,
     return true;
 }
 
+/// Applies a "props" object to a freshly created node. Shared by node.create and (indirectly)
+/// scene.load, so a property written one way behaves identically written the other.
+bool applyProps(Node* node, const rapidjson::Value& props, std::string& code, std::string& message)
+{
+    if (!props.IsObject())
+    {
+        code    = "invalid_params";
+        message = "\"props\" must be an object";
+        return false;
+    }
+
+    auto* reflection      = NodeReflection::getInstance();
+    const auto available  = reflection->listProperties(node);
+    for (auto it = props.MemberBegin(); it != props.MemberEnd(); ++it)
+    {
+        const std::string name(it->name.GetString(), it->name.GetStringLength());
+        const auto info = std::find_if(available.begin(), available.end(),
+                                       [&name](const PropertyInfo& candidate) { return candidate.name == name; });
+        if (info == available.end())
+        {
+            code    = "unknown_property";
+            message = "no such property: " + name;
+            return false;
+        }
+        if (!info->writable)
+        {
+            code    = "readonly_property";
+            message = "property is read-only: " + name;
+            return false;
+        }
+
+        PropertyValue decoded;
+        if (!decodePropertyValue(it->value, info->type, decoded))
+        {
+            code    = "type_mismatch";
+            message = "\"" + name + "\" does not match its declared type";
+            return false;
+        }
+        if (!reflection->setProperty(node, name, decoded))
+        {
+            code    = "type_mismatch";
+            message = "value was rejected for \"" + name + "\"";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The path of `node` within the running scene, for reporting back where something ended up.
+std::string pathWithinScene(SceneAccess* access, Node* node)
+{
+    Node* scene = access->getRunningScene();
+    return scene ? NodeReflection::getInstance()->pathOf(scene, node) : std::string();
+}
+
+bool handleNodeCreate(SceneAccess* access,
+                       const rapidjson::Value& params,
+                       rapidjson::Document& doc,
+                       rapidjson::Value& result,
+                       std::string& code,
+                       std::string& message)
+{
+    std::string parentPath, type;
+    if (!getRequiredString(params, "parentPath", parentPath) || !getRequiredString(params, "type", type))
+    {
+        code    = "invalid_params";
+        message = "\"parentPath\" and \"type\" are required";
+        return false;
+    }
+
+    Node* parent = resolveNode(access, parentPath, code, message);
+    if (!parent)
+        return false;
+
+    PropertyBag creationParams;
+    if (auto createIt = params.FindMember("create"); createIt != params.MemberEnd())
+    {
+        if (!createIt->value.IsObject())
+        {
+            code    = "invalid_params";
+            message = "\"create\" must be an object";
+            return false;
+        }
+        for (auto it = createIt->value.MemberBegin(); it != createIt->value.MemberEnd(); ++it)
+        {
+            PropertyValue value;
+            if (!decodePropertyValueInferred(it->value, value))
+            {
+                code    = "invalid_params";
+                message = "creation parameter \"" + std::string(it->name.GetString()) + "\" has an unsupported value";
+                return false;
+            }
+            creationParams.emplace_back(std::string(it->name.GetString(), it->name.GetStringLength()),
+                                        std::move(value));
+        }
+    }
+
+    std::string createError;
+    Node* node = NodeFactory::getInstance()->create(type, creationParams, createError);
+    if (!node)
+    {
+        // unknown_type rather than invalid_params: the caller's request was well-formed, the type
+        // simply is not one this build can make. scene.types is how they find out which are.
+        code    = NodeFactory::getInstance()->isRegistered(type) ? "invalid_params" : "unknown_type";
+        message = createError;
+        return false;
+    }
+
+    if (auto propsIt = params.FindMember("props"); propsIt != params.MemberEnd())
+    {
+        // Applied BEFORE attaching: a node rejected here must leave the scene untouched, and an
+        // autoreleased node that was never added simply goes away.
+        if (!applyProps(node, propsIt->value, code, message))
+            return false;
+    }
+
+    parent->addChild(node);
+
+    result.SetObject();
+    result.AddMember("path", jsonString(pathWithinScene(access, node), doc.GetAllocator()), doc.GetAllocator());
+    return true;
+}
+
+bool handleNodeDelete(SceneAccess* access,
+                       const rapidjson::Value& params,
+                       rapidjson::Document& /*doc*/,
+                       rapidjson::Value& result,
+                       std::string& code,
+                       std::string& message)
+{
+    std::string path;
+    if (!getRequiredString(params, "path", path))
+    {
+        code    = "invalid_params";
+        message = "\"path\" is required";
+        return false;
+    }
+
+    Node* node = resolveNode(access, path, code, message);
+    if (!node)
+        return false;
+
+    // Deleting the running scene out from under the Director is not an edit, it is a crash.
+    if (node == access->getRunningScene())
+    {
+        code    = "invalid_params";
+        message = "refusing to delete the running scene";
+        return false;
+    }
+
+    node->removeFromParent();
+    result.SetObject();
+    return true;
+}
+
+bool handleNodeReparent(SceneAccess* access,
+                         const rapidjson::Value& params,
+                         rapidjson::Document& doc,
+                         rapidjson::Value& result,
+                         std::string& code,
+                         std::string& message)
+{
+    std::string path, toPath;
+    if (!getRequiredString(params, "path", path) || !getRequiredString(params, "toPath", toPath))
+    {
+        code    = "invalid_params";
+        message = "\"path\" and \"toPath\" are required";
+        return false;
+    }
+
+    Node* node = resolveNode(access, path, code, message);
+    if (!node)
+        return false;
+
+    Node* newParent = resolveNode(access, toPath, code, message);
+    if (!newParent)
+        return false;
+
+    if (node == access->getRunningScene())
+    {
+        code    = "invalid_params";
+        message = "refusing to reparent the running scene";
+        return false;
+    }
+    if (node == newParent)
+    {
+        code    = "invalid_params";
+        message = "a node cannot be its own parent";
+        return false;
+    }
+    // Reparenting a node under its own descendant would detach that whole branch from the scene
+    // and leak it - the cycle keeps both alive with nothing referencing them.
+    for (Node* ancestor = newParent->getParent(); ancestor != nullptr; ancestor = ancestor->getParent())
+    {
+        if (ancestor == node)
+        {
+            code    = "invalid_params";
+            message = "refusing to reparent a node beneath itself";
+            return false;
+        }
+    }
+
+    // retain() across the move: the parent's reference is the only one holding this subtree alive.
+    //
+    // removeFromParentAndCleanup(FALSE), not removeFromParent(): the latter is
+    // removeFromParentAndCleanup(true), which runs stopAllActions() and unscheduleAllCallbacks()
+    // on the node AND every descendant. Moving a node is not deleting it - an agent that reparents
+    // an animating sprite would get a successful response, a correct path, and a silently frozen
+    // sprite. Axmol's own comment in Node::cleanup says to pass false for exactly this case.
+    node->retain();
+    node->removeFromParentAndCleanup(false);
+    newParent->addChild(node);
+    node->release();
+
+    result.SetObject();
+    result.AddMember("path", jsonString(pathWithinScene(access, node), doc.GetAllocator()), doc.GetAllocator());
+    return true;
+}
+
+bool handleSceneTypes(SceneAccess* /*access*/,
+                       const rapidjson::Value& /*params*/,
+                       rapidjson::Document& doc,
+                       rapidjson::Value& result,
+                       std::string& /*code*/,
+                       std::string& /*message*/)
+{
+    auto& allocator = doc.GetAllocator();
+    auto* factory   = NodeFactory::getInstance();
+
+    result.SetArray();
+    for (const auto& type : factory->registeredTypes())
+    {
+        rapidjson::Value entry(rapidjson::kObjectType);
+        entry.AddMember("type", jsonString(type, allocator), allocator);
+        rapidjson::Value params(rapidjson::kArrayType);
+        for (const auto& name : factory->creationParams(type))
+            params.PushBack(jsonString(name, allocator), allocator);
+        entry.AddMember("createParams", params, allocator);
+        result.PushBack(entry, allocator);
+    }
+    return true;
+}
+
+bool handleSceneSave(SceneAccess* access,
+                      const rapidjson::Value& params,
+                      rapidjson::Document& doc,
+                      rapidjson::Value& result,
+                      std::string& code,
+                      std::string& message)
+{
+    std::string file;
+    if (!getRequiredString(params, "file", file))
+    {
+        code    = "invalid_params";
+        message = "\"file\" is required";
+        return false;
+    }
+    if (pathEscapesWritableSandbox(file))
+    {
+        code    = "invalid_params";
+        message = "\"file\" must not escape the writable path";
+        return false;
+    }
+
+    std::string path = "/";
+    if (auto pathIt = params.FindMember("path"); pathIt != params.MemberEnd())
+    {
+        if (!pathIt->value.IsString())
+        {
+            code    = "invalid_params";
+            message = "\"path\" must be a string";
+            return false;
+        }
+        path.assign(pathIt->value.GetString(), pathIt->value.GetStringLength());
+    }
+
+    Node* node = resolveNode(access, path, code, message);
+    if (!node)
+        return false;
+
+    std::string json, serializeError;
+    if (!SceneSerializer::serialize(node, json, serializeError))
+    {
+        code    = "internal_error";
+        message = serializeError;
+        return false;
+    }
+
+    std::string outPath, writeError;
+    if (!access->writeTextFile(file, json, outPath, writeError))
+    {
+        code    = "internal_error";
+        message = writeError;
+        return false;
+    }
+
+    result.SetObject();
+    result.AddMember("path", jsonString(outPath, doc.GetAllocator()), doc.GetAllocator());
+    result.AddMember("bytes", static_cast<int>(json.size()), doc.GetAllocator());
+    return true;
+}
+
+bool handleSceneLoad(SceneAccess* access,
+                      const rapidjson::Value& params,
+                      rapidjson::Document& doc,
+                      rapidjson::Value& result,
+                      std::string& code,
+                      std::string& message)
+{
+    std::string file;
+    if (!getRequiredString(params, "file", file))
+    {
+        code    = "invalid_params";
+        message = "\"file\" is required";
+        return false;
+    }
+    if (pathEscapesWritableSandbox(file))
+    {
+        // Reading is resolved through FileUtils rather than the sandbox, but a traversing name is
+        // still refused: the bridge should not be a way to read arbitrary files off the machine.
+        code    = "invalid_params";
+        message = "\"file\" must not escape the resource path";
+        return false;
+    }
+
+    std::string parentPath = "/";
+    if (auto parentIt = params.FindMember("parentPath"); parentIt != params.MemberEnd())
+    {
+        if (!parentIt->value.IsString())
+        {
+            code    = "invalid_params";
+            message = "\"parentPath\" must be a string";
+            return false;
+        }
+        parentPath.assign(parentIt->value.GetString(), parentIt->value.GetStringLength());
+    }
+
+    bool replace = false;
+    if (auto replaceIt = params.FindMember("replace"); replaceIt != params.MemberEnd())
+    {
+        if (!replaceIt->value.IsBool())
+        {
+            code    = "invalid_params";
+            message = "\"replace\" must be a boolean";
+            return false;
+        }
+        replace = replaceIt->value.GetBool();
+    }
+
+    // "contents" is what "load this scene" means: keep the running scene object - which is the
+    // game's own Scene subclass, application code with its own lifecycle that no factory can or
+    // should rebuild - and repopulate it from the file. "child" reconstructs the file's root node
+    // itself, which is what you want for a saved subtree.
+    bool contentsOnly = false;
+    if (auto modeIt = params.FindMember("mode"); modeIt != params.MemberEnd())
+    {
+        if (!modeIt->value.IsString())
+        {
+            code    = "invalid_params";
+            message = "\"mode\" must be a string";
+            return false;
+        }
+        const std::string_view mode(modeIt->value.GetString(), modeIt->value.GetStringLength());
+        if (mode == "contents")
+            contentsOnly = true;
+        else if (mode != "child")
+        {
+            code    = "invalid_params";
+            message = "\"mode\" must be \"child\" or \"contents\"";
+            return false;
+        }
+    }
+
+    SceneSerializer::LoadOptions options;
+    if (auto degradedIt = params.FindMember("allowDegraded"); degradedIt != params.MemberEnd())
+    {
+        if (!degradedIt->value.IsBool())
+        {
+            code    = "invalid_params";
+            message = "\"allowDegraded\" must be a boolean";
+            return false;
+        }
+        options.allowDegraded = degradedIt->value.GetBool();
+    }
+
+    Node* parent = resolveNode(access, parentPath, code, message);
+    if (!parent)
+        return false;
+
+    std::string json, readError;
+    if (!access->readTextFile(file, json, readError))
+    {
+        code    = "invalid_path";
+        message = readError;
+        return false;
+    }
+
+    std::string loadError;
+    std::vector<std::string> warnings;
+    std::vector<Node*> loadedChildren;
+    Node* loadedRoot = nullptr;
+
+    if (contentsOnly)
+    {
+        if (!SceneSerializer::deserializeChildren(json, options, loadedChildren, loadError, warnings))
+        {
+            code    = "internal_error";
+            message = loadError;
+            return false;
+        }
+    }
+    else
+    {
+        loadedRoot = SceneSerializer::deserialize(json, options, loadError, warnings);
+        if (!loadedRoot)
+        {
+            // The scene file is data, not a request, so a bad one is not invalid_params - but the
+            // message carries the serializer's own explanation, which names the offending node.
+            code    = "internal_error";
+            message = loadError;
+            return false;
+        }
+    }
+
+    // Only now that the whole tree is built is anything in the live scene touched: a failed load
+    // must never leave the scene half-replaced.
+    if (replace)
+        parent->removeAllChildren();
+
+    if (contentsOnly)
+    {
+        for (Node* child : loadedChildren)
+            parent->addChild(child);
+    }
+    else
+    {
+        parent->addChild(loadedRoot);
+    }
+
+    auto& allocator = doc.GetAllocator();
+    result.SetObject();
+    result.AddMember("path", jsonString(pathWithinScene(access, contentsOnly ? parent : loadedRoot), allocator),
+                     allocator);
+    result.AddMember("nodesAdded", static_cast<int>(contentsOnly ? loadedChildren.size() : 1u), allocator);
+    rapidjson::Value warningsJson(rapidjson::kArrayType);
+    for (const auto& warning : warnings)
+        warningsJson.PushBack(jsonString(warning, allocator), allocator);
+    result.AddMember("warnings", warningsJson, allocator);
+    return true;
+}
+
 bool handleDirectorPause(SceneAccess* access,
                           const rapidjson::Value& /*params*/,
                           rapidjson::Document& /*doc*/,
@@ -772,6 +1004,18 @@ bool dispatch(std::string_view method,
         return handleNodeGet(access, params, doc, result, code, message);
     if (method == "node.set")
         return handleNodeSet(access, params, doc, result, code, message);
+    if (method == "node.create")
+        return handleNodeCreate(access, params, doc, result, code, message);
+    if (method == "node.delete")
+        return handleNodeDelete(access, params, doc, result, code, message);
+    if (method == "node.reparent")
+        return handleNodeReparent(access, params, doc, result, code, message);
+    if (method == "scene.types")
+        return handleSceneTypes(access, params, doc, result, code, message);
+    if (method == "scene.save")
+        return handleSceneSave(access, params, doc, result, code, message);
+    if (method == "scene.load")
+        return handleSceneLoad(access, params, doc, result, code, message);
     if (method == "input.tap")
         return handleInputTap(access, params, doc, result, code, message);
     if (method == "input.swipe")

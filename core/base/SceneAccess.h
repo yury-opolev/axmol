@@ -96,6 +96,23 @@ public:
 
     /** The Director's current frame rate. */
     virtual float getFrameRate() const = 0;
+
+    /** Writes `contents` to `file` inside the writable path, creating or truncating it. Same
+        sandbox rule as captureScreenshot: `file` is validated by AgentRequestHandler before this
+        is called, and implementations enforce it again. On success sets `outPath` to the absolute
+        path written.
+
+        The engine deliberately cannot write anywhere else. Making a saved scene land in the
+        PROJECT is the host-side tooling's job (it copies the file out), not the engine's - a
+        bridge reachable from a socket that could write anywhere on disk would be a materially
+        different security proposition. */
+    virtual bool writeTextFile(std::string_view file, std::string_view contents, std::string& outPath,
+                               std::string& outError) = 0;
+
+    /** Reads `file` through the engine's resource resolution, so a name like
+        "scenes/level1.scene.json" is found on the search path (i.e. in Content/) exactly as any
+        other asset would be. Returns false with `outError` set if it does not exist. */
+    virtual bool readTextFile(std::string_view file, std::string& outContents, std::string& outError) = 0;
 };
 
 /** Real implementation of SceneAccess, wrapping ax::Director. Uses utils::captureScreen (see
@@ -114,6 +131,9 @@ public:
     void injectSwipe(float x1, float y1, float x2, float y2) override;
     void setPaused(bool paused) override;
     bool isPaused() const override;
+    bool writeTextFile(std::string_view file, std::string_view contents, std::string& outPath,
+                       std::string& outError) override;
+    bool readTextFile(std::string_view file, std::string& outContents, std::string& outError) override;
     std::string getEngineVersion() const override;
     Vec2 getDesignResolution() const override;
     Vec2 getFrameSize() const override;

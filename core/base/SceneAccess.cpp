@@ -130,6 +130,71 @@ bool DirectorSceneAccess::captureScreenshot(std::string_view file, std::string& 
     return true;
 }
 
+bool DirectorSceneAccess::writeTextFile(std::string_view file,
+                                        std::string_view contents,
+                                        std::string& outPath,
+                                        std::string& outError)
+{
+    if (file.empty())
+    {
+        outError = "file name is required";
+        return false;
+    }
+    // Defence in depth, exactly as for captureScreenshot: AgentRequestHandler validates this
+    // before calling, and this enforces it again so the rule cannot be bypassed by reaching the
+    // implementation directly.
+    if (pathEscapesWritableSandbox(file))
+    {
+        outError = "file escapes the writable path";
+        return false;
+    }
+
+    auto* fileUtils = FileUtils::getInstance();
+    outPath         = fileUtils->getWritablePath() + std::string(file);
+
+    // writeStringToFile does not create intermediate directories, and `file` is allowed to name a
+    // subdirectory (scenes/level1.scene.json) so that saving and loading agree on one name.
+    const auto slash = outPath.find_last_of("/\\");
+    if (slash != std::string::npos)
+        fileUtils->createDirectories(outPath.substr(0, slash));
+
+    if (!fileUtils->writeStringToFile(std::string(contents), outPath))
+    {
+        outError = "could not write " + outPath;
+        return false;
+    }
+    return true;
+}
+
+bool DirectorSceneAccess::readTextFile(std::string_view file, std::string& outContents, std::string& outError)
+{
+    if (file.empty())
+    {
+        outError = "file name is required";
+        return false;
+    }
+    // Read through FileUtils rather than the raw filesystem so a scene is found on the resource
+    // search path (i.e. in Content/) like any other asset, and so a scene saved during development
+    // loads the same way in a packaged build.
+    auto* fileUtils = FileUtils::getInstance();
+    if (!fileUtils->isFileExist(file))
+    {
+        // Fall back to the writable path, where scene.save just put it - a save/load round trip
+        // in a single session should not require the file to have been copied into Content first.
+        const std::string writablePath = fileUtils->getWritablePath() + std::string(file);
+        if (!fileUtils->isFileExist(writablePath))
+        {
+            outError = "no such file: " + std::string(file);
+            return false;
+        }
+        outContents = fileUtils->getStringFromFile(writablePath);
+        return true;
+    }
+
+    outContents = fileUtils->getStringFromFile(file);
+    return true;
+}
+
 void DirectorSceneAccess::injectTap(float x, float y)
 {
     auto* renderView = Director::getInstance()->getRenderView();

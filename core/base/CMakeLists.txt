@@ -82,6 +82,12 @@ set(_AX_BASE_HEADER
   base/JsonWriter.h
   base/JobSystem.h
   base/NodeReflection.h
+  # Ungated, unlike the agent bridge: a game that ships a scene saved during development must be
+  # able to LOAD it in a release build, so scene reading is an ordinary engine capability. Only
+  # WRITING one from a socket stays debug-only, inside AgentRequestHandler.
+  base/NodeFactory.h
+  base/PropertyJson.h
+  base/SceneSerializer.h
 )
 
 set(_AX_BASE_SRC
@@ -138,6 +144,9 @@ set(_AX_BASE_SRC
   base/s3tc.cpp
   base/astc.cpp
   base/NodeReflection.cpp
+  base/NodeFactory.cpp
+  base/PropertyJson.cpp
+  base/SceneSerializer.cpp
   ${_AX_BASE_SPECIFIC_SRC}
 )
 
