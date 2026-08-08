@@ -53,6 +53,15 @@ set(GAME_SOURCE
     Source/core/ui/UIHelperTests.cpp
 )
 
+# AgentRequestHandler/SceneAccess (and thus their tests) only exist when the engine was built
+# with AX_ENABLE_AGENT_BRIDGE - see core/base/CMakeLists.txt. AX_ENABLE_AGENT_BRIDGE is set by
+# the add_subdirectory(core) above, before this point.
+if(AX_ENABLE_AGENT_BRIDGE)
+  set(GAME_SOURCE ${GAME_SOURCE}
+    Source/core/base/AgentBridgeFramingTests.cpp
+    Source/core/base/AgentRequestHandlerTests.cpp
+  )
+endif()
 
 set(GAME_INC_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/Source"

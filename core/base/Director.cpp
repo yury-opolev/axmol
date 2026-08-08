@@ -62,6 +62,9 @@ THE SOFTWARE.
 #endif
 #include "base/ObjectFactory.h"
 #include "platform/Application.h"
+#ifdef AX_ENABLE_AGENT_BRIDGE
+#    include "base/AgentBridge.h"
+#endif
 #if defined(AX_ENABLE_AUDIO)
 #    include "audio/AudioEngine.h"
 #endif
@@ -171,6 +174,26 @@ bool Director::init()
 Director::~Director()
 {
     AXLOGD("deallocing Director: {}", fmt::ptr(this));
+
+#ifdef AX_ENABLE_AGENT_BRIDGE
+    // Must run first, before anything else in this destructor: AgentBridge's listener thread
+    // marshals every request onto this Director's Scheduler via runOnAxmolThread() and BLOCKS
+    // waiting for the result (see AgentBridge.cpp's dispatchLine(), and design doc §3).
+    // destroyInstance() joins that listener thread before returning, so by the time this line
+    // completes, nothing can call Director::getInstance()->getScheduler() from that thread again -
+    // only after that is it safe to release the scheduler and everything else below. Without this
+    // call, nothing ever stops AgentBridge's thread: Director::getInstance() called from a still-
+    // running listener thread after this point would lazily construct a whole NEW Director (see
+    // getInstance()), and a request already marshalled when the Scheduler is torn down could see
+    // its promise broken (handled, but only because AgentBridge itself now catches that - see
+    // dispatchLine()). This mirrors why Console is stopped/deleted during Director teardown (see
+    // `delete _console` below) - AgentBridge just has to go strictly first, since it actively
+    // blocks on the scheduler staying valid and responsive in a way Console's fire-and-forget
+    // commands do not. A build with AX_ENABLE_AGENT_BRIDGE off, or one that never called
+    // AgentBridge::getInstance()/listen(), pays nothing here: destroyInstance() on a
+    // never-constructed singleton is a safe no-op.
+    AgentBridge::destroyInstance();
+#endif
 
 #if AX_ENABLE_CACHE_TEXTURE_DATA
     _eventDispatcher->removeEventListener(_rendererRecreatedListener);

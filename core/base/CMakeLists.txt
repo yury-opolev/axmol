@@ -150,3 +150,13 @@ if(AX_ENABLE_CONSOLE)
   set(_AX_BASE_HEADER ${_AX_BASE_HEADER} base/Console.h)
   set(_AX_BASE_SRC ${_AX_BASE_SRC} base/Console.cpp)
 endif()
+
+if(AX_ENABLE_AGENT_BRIDGE)
+  # SceneAccess and AgentRequestHandler (the "pure half" of the agent bridge - see the design
+  # doc's §2 architecture split) are gated here too, not just AgentBridge itself: with the option
+  # OFF, a build must not ship AX_DLL-exported screenshot-to-disk, synthetic touch injection and
+  # the full JSON scene-mutation dispatcher just because nothing happens to call listen() - see
+  # the design doc §5, "Compiled only when AX_ENABLE_AGENT_BRIDGE is ON."
+  set(_AX_BASE_HEADER ${_AX_BASE_HEADER} base/SceneAccess.h base/AgentRequestHandler.h base/AgentBridge.h)
+  set(_AX_BASE_SRC ${_AX_BASE_SRC} base/SceneAccess.cpp base/AgentRequestHandler.cpp base/AgentBridge.cpp)
+endif()

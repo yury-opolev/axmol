@@ -104,6 +104,7 @@ cmake_dependent_option(AX_ENABLE_MEDIA "Build media support" ON "AX_ENABLE_MFMED
 option(AX_ENABLE_AUDIO "Build audio support" ON)
 option(AX_ENABLE_OPUS "Build with opus support" ON)
 option(AX_ENABLE_CONSOLE "Build axmol debug tool: console support" ON)
+option(AX_ENABLE_AGENT_BRIDGE "Build axmol debug tool: agent bridge (TCP/JSON scene inspection and mutation) support" ON)
 
 option(AX_ENABLE_3D "Build 3D support" ON)
 cmake_dependent_option(AX_ENABLE_3D_PHYSICS "Build 3D Physics support" ON "AX_ENABLE_3D" OFF)
@@ -349,6 +350,7 @@ ax_config_pred(${_AX_CORE_LIB} AX_ENABLE_NAVMESH)
 ax_config_pred(${_AX_CORE_LIB} AX_ENABLE_MEDIA)
 ax_config_pred(${_AX_CORE_LIB} AX_ENABLE_AUDIO)
 ax_config_pred(${_AX_CORE_LIB} AX_ENABLE_CONSOLE)
+ax_config_pred(${_AX_CORE_LIB} AX_ENABLE_AGENT_BRIDGE)
 ax_config_pred(${_AX_CORE_LIB} AX_CORE_PROFILE)
 
 # add base macro define and compile options
