@@ -836,3 +836,71 @@ TEST_SUITE("core/base/NodeReflection-meshcount")
     }
 }
 #endif  // AX_ENABLE_3D
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-bounds")
+{
+    TEST_CASE("boundsMin and boundsMax are reflected and read-only")
+    {
+        // Bounds close the last gap that forced a rebuild-and-look loop: without them an agent
+        // cannot learn how big a loaded model actually is, so framing, layout and any hit test
+        // have to be told the size out of band - which is how a hardcoded extent ends up in game
+        // code, silently wrong the moment the artist re-exports at a different scale.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        PropertyValue value;
+        CHECK(reflection->getProperty(mesh, "boundsMin", value));
+        CHECK(std::holds_alternative<Vec3>(value));
+        CHECK(reflection->getProperty(mesh, "boundsMax", value));
+        CHECK(std::holds_alternative<Vec3>(value));
+
+        // Read-only: bounds describe the loaded geometry. A settable one would be a write that
+        // silently does nothing.
+        CHECK_FALSE(reflection->setProperty(mesh, "boundsMin", Vec3(1.0f, 2.0f, 3.0f)));
+
+        const auto properties = reflection->listProperties(mesh);
+        for (const auto& name : {"boundsMin", "boundsMax"})
+        {
+            CAPTURE(name);
+            const auto entry = std::find_if(properties.begin(), properties.end(),
+                                            [&](const PropertyInfo& p) { return p.name == name; });
+            REQUIRE(entry != properties.end());
+            CHECK(entry->type == PropertyType::Vec3);
+            CHECK_FALSE(entry->writable);
+        }
+
+        mesh->release();
+    }
+
+    TEST_CASE("bounds come from the RECURSIVE walk, so a tree root reports its children")
+    {
+        // The distinction the whole property exists for. getAABB() covers only meshes a node owns
+        // directly; a multi-object model puts every mesh in CHILD MeshRenderers, so the root owns
+        // none and the non-recursive box is AABB::reset()'s sentinel - min +99999, max -99999.
+        // Nothing checks for that, so it silently poisons whatever it is fed into.
+        //
+        // Built by hand rather than loaded, because constructing real mesh data needs assets a
+        // headless suite does not have: an empty PARENT with an empty CHILD still proves which of
+        // the two walks is being used, because a recursive walk visits the child at all.
+        auto* parent = MeshRenderer::create();
+        auto* child  = MeshRenderer::create();
+        REQUIRE(parent != nullptr);
+        REQUIRE(child != nullptr);
+        parent->retain();
+        parent->addChild(child);
+
+        PropertyValue value;
+        REQUIRE(NodeReflection::getInstance()->getProperty(parent, "boundsMin", value));
+
+        // Both are empty, so the merged result is still the sentinel - but it must MATCH what
+        // getAABBRecursively returns rather than what getAABB does, which is what this pins.
+        const auto recursive = parent->getAABBRecursively();
+        CHECK_EQ(recursive._min, std::get<Vec3>(value));
+
+        parent->release();
+    }
+}
+#endif  // AX_ENABLE_3D
