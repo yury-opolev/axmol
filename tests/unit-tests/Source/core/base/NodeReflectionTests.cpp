@@ -904,3 +904,78 @@ TEST_SUITE("core/base/NodeReflection-bounds")
     }
 }
 #endif  // AX_ENABLE_3D
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-pick")
+{
+    TEST_CASE("pick refuses impossible inputs rather than guessing")
+    {
+        // Every one of these has a plausible wrong answer - "/" for a null root, the origin for a
+        // zero-sized view - and returning one would be worse than refusing, because a caller has
+        // no way to tell a real hit from a fabricated one.
+        auto* reflection = NodeReflection::getInstance();
+        auto* node       = Node::create();
+        node->retain();
+        auto* camera = Camera::create();
+        REQUIRE(camera != nullptr);
+        camera->retain();
+
+        PickHit hit;
+        CHECK_FALSE(reflection->pick(nullptr, camera, Vec2(10.0f, 10.0f), Vec2(100.0f, 100.0f), hit));
+        CHECK_FALSE(reflection->pick(node, nullptr, Vec2(10.0f, 10.0f), Vec2(100.0f, 100.0f), hit));
+        // A zero-sized view cannot define a ray; unprojecting through it divides by zero.
+        CHECK_FALSE(reflection->pick(node, camera, Vec2(10.0f, 10.0f), Vec2(0.0f, 0.0f), hit));
+
+        camera->release();
+        node->release();
+    }
+
+    TEST_CASE("pick misses cleanly when nothing under the cursor draws anything")
+    {
+        // A miss must be a plain false, not an error and not a hit on the nearest node that
+        // happens to exist. Tapping the background is ordinary.
+        //
+        // Every node here is either a plain Node or an empty MeshRenderer - meshCount 0 - which is
+        // exactly the case pick() must skip: the root of a multi-object model owns no geometry, and
+        // reporting it would name something that draws nothing while hiding whatever is behind it.
+        auto* root = Node::create();
+        root->retain();
+        auto* emptyMesh = MeshRenderer::create();
+        REQUIRE(emptyMesh != nullptr);
+        REQUIRE(emptyMesh->getMeshCount() == 0);
+        root->addChild(emptyMesh);
+
+        auto* camera = Camera::create();
+        REQUIRE(camera != nullptr);
+        camera->retain();
+
+        PickHit hit;
+        CHECK_FALSE(NodeReflection::getInstance()->pick(root, camera, Vec2(50.0f, 50.0f),
+                                                        Vec2(100.0f, 100.0f), hit));
+
+        camera->release();
+        root->release();
+    }
+
+    TEST_CASE("a miss leaves the caller's PickHit untouched")
+    {
+        // Documented contract, and the kind that quietly rots: a caller that reuses one PickHit
+        // across several picks would otherwise read a stale hit as a fresh one.
+        auto* root = Node::create();
+        root->retain();
+        auto* camera = Camera::create();
+        camera->retain();
+
+        PickHit hit;
+        hit.path     = "/sentinel";
+        hit.distance = 42.0f;
+
+        CHECK_FALSE(NodeReflection::getInstance()->pick(root, camera, Vec2(5.0f, 5.0f), Vec2(80.0f, 80.0f), hit));
+        CHECK_EQ(std::string("/sentinel"), hit.path);
+        CHECK(hit.distance == doctest::Approx(42.0f));
+
+        camera->release();
+        root->release();
+    }
+}
+#endif  // AX_ENABLE_3D

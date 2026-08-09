@@ -41,6 +41,7 @@
 #    include "2d/Camera.h"
 #    include "2d/Light.h"
 #    include "3d/MeshRenderer.h"
+#    include "3d/Ray.h"
 #endif
 #include "base/Protocols.h"
 #include "platform/FileUtils.h"
@@ -1079,6 +1080,95 @@ bool NodeReflection::setProperty(Node* node, std::string_view name, const Proper
     }
     return false;
 }
+
+#if defined(AX_ENABLE_3D)
+
+namespace
+{
+/// Walks `node` and its descendants, keeping the nearest MeshRenderer the ray passes through.
+///
+/// Nearest by ray distance rather than by draw order or tree order: with a perspective camera the
+/// thing in front is what a person means by "the one I clicked", and tree order says nothing about
+/// depth.
+void pickNearest(Node* node,
+                 const Ray& ray,
+                 const std::string& path,
+                 const NodeReflection& reflection,
+                 PickHit& best,
+                 bool& found)
+{
+    auto* mesh = dynamic_cast<MeshRenderer*>(node);
+    // meshCount > 0 filters out the roots of multi-object models, which own no geometry. Testing
+    // them would report a hit on a node that draws nothing and hide the piece actually under the
+    // cursor behind it.
+    if (mesh && mesh->getMeshCount() > 0)
+    {
+        float distance = 0.0f;
+        if (ray.intersects(mesh->getAABB(), &distance) && (!found || distance < best.distance))
+        {
+            best.path     = path;
+            best.typeName = NodeReflection::getTypeName(node);
+            best.name     = std::string(node->getName());
+            best.distance = distance;
+            found         = true;
+        }
+    }
+
+    // Sorted, so the indices in the path mean what resolve() and describeTree() mean by them.
+    node->sortAllChildren();
+    const auto& children = node->getChildren();
+    for (ssize_t index = 0; index < static_cast<ssize_t>(children.size()); ++index)
+    {
+        const auto childPath = (path == "/") ? "/" + std::to_string(index) : path + "/" + std::to_string(index);
+        pickNearest(children.at(index), ray, childPath, reflection, best, found);
+    }
+}
+}  // namespace
+
+bool NodeReflection::pick(Node* root, Camera* camera, const Vec2& screenPoint, const Vec2& viewSize,
+                          PickHit& out) const
+{
+    if (!root || !camera || viewSize.x <= 0.0f || viewSize.y <= 0.0f)
+    {
+        return false;
+    }
+
+    // unprojectGL wants GL screen space, whose origin is BOTTOM-left, while screenPoint arrives
+    // top-left to match input.tap. Flipping here rather than at the call site keeps the bridge's
+    // one convention intact; letting the two disagree mirrors every pick vertically, which looks
+    // plausible on a symmetric board and is maddening to track down.
+    const Vec3 nearPoint(screenPoint.x, viewSize.y - screenPoint.y, -1.0f);
+    const Vec3 farPoint(screenPoint.x, viewSize.y - screenPoint.y, 1.0f);
+
+    Vec3 nearWorld;
+    Vec3 farWorld;
+    camera->unprojectGL(viewSize, &nearPoint, &nearWorld);
+    camera->unprojectGL(viewSize, &farPoint, &farWorld);
+
+    Vec3 direction = farWorld - nearWorld;
+    if (direction.lengthSquared() <= 0.0f)
+    {
+        // A degenerate projection - an orthographic camera with a zero depth range, say - would
+        // otherwise normalise to NaN and make every intersection test quietly false.
+        return false;
+    }
+    direction.normalize();
+
+    Ray ray;
+    ray._origin    = nearWorld;
+    ray._direction = direction;
+
+    PickHit best;
+    bool found = false;
+    pickNearest(root, ray, "/", *this, best, found);
+    if (found)
+    {
+        out = best;
+    }
+    return found;
+}
+
+#endif  // AX_ENABLE_3D
 
 bool NodeReflection::addProvider(std::string_view id, std::unique_ptr<PropertyProvider> provider)
 {

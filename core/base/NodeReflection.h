@@ -40,6 +40,7 @@ namespace ax
 {
 
 class Node;
+class Camera;
 
 /** The engine type of a reflected property value. Mirrors the alternatives of PropertyValue. */
 enum class PropertyType
@@ -99,6 +100,15 @@ struct NodeInfo
     bool visible        = true;
     Color4B color;  ///< rgb from Node::getColor(), a from Node::getOpacity() - opacity is carried
                     ///< in the alpha channel, and writing this property also writes opacity.
+};
+
+/** One node hit by a pick, with how far along the ray it was found. */
+struct PickHit
+{
+    std::string path;      ///< canonical child-index path, resolvable with NodeReflection::resolve
+    std::string typeName;  ///< demangled RTTI type name
+    std::string name;      ///< Node::getName()
+    float distance = 0.0f;  ///< distance from the ray origin, so callers can reason about depth
 };
 
 /** Supplies a named set of properties for a family of node types (e.g. all nodes, sprites,
@@ -180,6 +190,25 @@ public:
     /** The union of PropertyInfo from every registered provider that supports `node`. Empty if
         `node` is null. */
     std::vector<PropertyInfo> listProperties(Node* node) const;
+
+#if defined(AX_ENABLE_3D)
+    /** Finds the nearest MeshRenderer under `root` whose bounds the camera ray through
+        `screenPoint` passes through - "what is under the cursor", the question a scene view asks
+        every time someone clicks.
+
+        `screenPoint` is in TOP-LEFT origin screen coordinates, matching the input the bridge
+        already accepts for taps, and `viewSize` is the frame it refers to. Getting these two
+        conventions to disagree is the classic way picking ends up mirrored vertically, so they
+        are taken together rather than read from a global.
+
+        Only nodes that actually DRAW are considered - those reporting meshCount > 0. A model with
+        several named objects is loaded as a tree whose root owns no meshes, and returning that
+        root would name a node with no geometry while the thing under the cursor went unmentioned.
+        Callers wanting the logical object walk up from the hit.
+
+        Returns false, leaving `out` untouched, if root or camera is null or nothing was hit. */
+    bool pick(Node* root, Camera* camera, const Vec2& screenPoint, const Vec2& viewSize, PickHit& out) const;
+#endif
 
     /** Reads a property by consulting registered providers most-recently-registered-first (see
         the ordering comment on _providers); the first provider that both supports the node and
