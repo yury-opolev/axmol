@@ -34,6 +34,14 @@
 #include "2d/Label.h"
 #include "2d/Node.h"
 #include "2d/Sprite.h"
+#if defined(AX_ENABLE_3D)
+// Camera and Light live under core/2d despite being 3D concepts, but MeshRenderer does not - and
+// core/3d is only compiled when AX_ENABLE_3D is on (core/CMakeLists.txt:190). This file is built
+// unconditionally, so everything that touches those types stays behind this guard.
+#    include "2d/Camera.h"
+#    include "2d/Light.h"
+#    include "3d/MeshRenderer.h"
+#endif
 #include "base/Protocols.h"
 #include "platform/FileUtils.h"
 #include "fmt/format.h"
@@ -75,6 +83,12 @@ public:
             {"visible", PropertyType::Bool, true},        {"name", PropertyType::String, true},
             {"tag", PropertyType::Int, true},              {"color", PropertyType::Color, true},
             {"opacity", PropertyType::Int, true},
+            // The 3D transform lives here, on the provider that supports EVERY node, rather than
+            // behind AX_ENABLE_3D: Node carries this state whether or not core/3d is compiled, and
+            // laying 2D sprites out at differing depths is an ordinary thing to want. Gating them
+            // would make the property surface depend on a build option unrelated to them.
+            {"position3D", PropertyType::Vec3, true},     {"rotation3D", PropertyType::Vec3, true},
+            {"scaleZ", PropertyType::Float, true},
         };
     }
 
@@ -94,6 +108,12 @@ public:
             out = node->getScaleY();
         else if (name == "rotation")
             out = node->getRotation();
+        else if (name == "position3D")
+            out = node->getPosition3D();
+        else if (name == "rotation3D")
+            out = node->getRotation3D();
+        else if (name == "scaleZ")
+            out = node->getScaleZ();
         else if (name == "localZOrder")
             out = node->getLocalZOrder();
         else if (name == "globalZOrder")
@@ -152,6 +172,24 @@ public:
             if (!std::holds_alternative<float>(value))
                 return false;
             node->setRotation(std::get<float>(value));
+        }
+        else if (name == "position3D")
+        {
+            if (!std::holds_alternative<Vec3>(value))
+                return false;
+            node->setPosition3D(std::get<Vec3>(value));
+        }
+        else if (name == "rotation3D")
+        {
+            if (!std::holds_alternative<Vec3>(value))
+                return false;
+            node->setRotation3D(std::get<Vec3>(value));
+        }
+        else if (name == "scaleZ")
+        {
+            if (!std::holds_alternative<float>(value))
+                return false;
+            node->setScaleZ(std::get<float>(value));
         }
         else if (name == "localZOrder")
         {
@@ -420,6 +458,271 @@ public:
     }
 };
 
+#if defined(AX_ENABLE_3D)
+
+/// Mesh-specific properties. The model itself is absent on purpose: a MeshRenderer's geometry is
+/// fixed at construction, so it is a NodeFactory creation parameter rather than a property, for
+/// the same reason a Sprite's texture is. texturePath is exposed read-only so the serializer can
+/// capture it without implying it can be reassigned.
+class MeshRendererPropertyProvider : public PropertyProvider
+{
+public:
+    bool supports(Node* node) const override { return dynamic_cast<MeshRenderer*>(node) != nullptr; }
+
+    std::vector<PropertyInfo> list() const override
+    {
+        return {
+            // Read-only for the same reason ax::Sprite's texturePath is: geometry is fixed at
+            // construction, so assigning here could not remodel a live renderer. It is exposed at
+            // all because NodeFactory declares it a creation parameter, and the serializer
+            // captures those by READING THEM BACK as properties (SceneSerializer.cpp:130-135) -
+            // a declared parameter no provider can read is silently dropped, producing a file that
+            // saves without complaint and cannot be reloaded.
+            {"modelPath", PropertyType::String, false},
+            {"texturePath", PropertyType::String, false},
+            {"lightMask", PropertyType::Int, true},
+        };
+    }
+
+    bool get(Node* node, std::string_view name, PropertyValue& out) const override
+    {
+        auto* mesh = dynamic_cast<MeshRenderer*>(node);
+        if (!mesh)
+            return false;
+
+        if (name == "modelPath")
+        {
+            out = std::string(mesh->getModelPath());
+            return true;
+        }
+        if (name == "texturePath")
+        {
+            // Mirrors SpritePropertyProvider: the path a texture came from is recoverable only
+            // from the texture itself. MeshRenderer has no getTexture() - a model can carry
+            // several meshes, each with its own material - so this reports the first mesh's
+            // diffuse texture, which is what a single-texture model (the case the factory's
+            // texturePath parameter covers) has.
+            auto* firstMesh = mesh->getMesh();
+            auto* texture   = firstMesh ? firstMesh->getTexture() : nullptr;
+            out             = texture ? std::string(texture->getPath()) : std::string();
+            return true;
+        }
+        if (name == "lightMask")
+        {
+            out = static_cast<int>(mesh->getLightMask());
+            return true;
+        }
+        return false;
+    }
+
+    bool set(Node* node, std::string_view name, const PropertyValue& value) const override
+    {
+        auto* mesh = dynamic_cast<MeshRenderer*>(node);
+        if (!mesh || name != "lightMask" || !std::holds_alternative<int>(value))
+            return false;
+
+        mesh->setLightMask(static_cast<unsigned int>(std::get<int>(value)));
+        return true;
+    }
+};
+
+/// Camera properties. Field of view is deliberately NOT here: Camera fixes it in
+/// createPerspective and offers no setter, and a property that silently fails to apply is worse
+/// than an absent one - the caller sees success and a frame that did not change.
+class CameraPropertyProvider : public PropertyProvider
+{
+public:
+    bool supports(Node* node) const override { return dynamic_cast<Camera*>(node) != nullptr; }
+
+    std::vector<PropertyInfo> list() const override
+    {
+        return {
+            // Read-only, and present only so the serializer can capture it: Camera fixes the fov
+            // in createPerspective and has no setter, but NodeFactory declares it a creation
+            // parameter, and an unreadable creation parameter is silently dropped at save time
+            // (SceneSerializer.cpp:130-135) - the camera would then reload at the default 60
+            // degrees while the file claimed to have round-tripped.
+            {"fieldOfView", PropertyType::Float, false},
+            {"nearPlane", PropertyType::Float, true},
+            {"farPlane", PropertyType::Float, true},
+            {"depth", PropertyType::Int, true},
+            {"cameraFlag", PropertyType::Int, true},
+        };
+    }
+
+    bool get(Node* node, std::string_view name, PropertyValue& out) const override
+    {
+        auto* camera = dynamic_cast<Camera*>(node);
+        if (!camera)
+            return false;
+
+        if (name == "fieldOfView")
+            out = camera->getFOV();
+        else if (name == "nearPlane")
+            out = camera->getNearPlane();
+        else if (name == "farPlane")
+            out = camera->getFarPlane();
+        else if (name == "depth")
+            out = static_cast<int>(camera->getDepth());
+        else if (name == "cameraFlag")
+            out = static_cast<int>(camera->getCameraFlag());
+        else
+            return false;
+        return true;
+    }
+
+    bool set(Node* node, std::string_view name, const PropertyValue& value) const override
+    {
+        auto* camera = dynamic_cast<Camera*>(node);
+        if (!camera)
+            return false;
+
+        if (name == "nearPlane")
+        {
+            if (!std::holds_alternative<float>(value))
+                return false;
+            camera->setNearPlane(std::get<float>(value));
+        }
+        else if (name == "farPlane")
+        {
+            if (!std::holds_alternative<float>(value))
+                return false;
+            camera->setFarPlane(std::get<float>(value));
+        }
+        else if (name == "depth")
+        {
+            if (!std::holds_alternative<int>(value))
+                return false;
+            camera->setDepth(static_cast<int8_t>(std::get<int>(value)));
+        }
+        else if (name == "cameraFlag")
+        {
+            if (!std::holds_alternative<int>(value))
+                return false;
+            camera->setCameraFlag(static_cast<CameraFlag>(std::get<int>(value)));
+        }
+        else
+        {
+            return false;
+        }
+        return true;
+    }
+};
+
+/// Light properties. Colour is absent because BaseLight derives from Node, so the base provider's
+/// "color" already reads and writes it - adding a second name for one piece of state would give
+/// an agent two ways to ask the same question and no way to know they are the same.
+///
+/// Range and direction are declared for every light even though they apply only to some: a
+/// property list is per-TYPE, not per-instance, and get/set return false on a light that has no
+/// such concept, which is the same answer an unknown name gets.
+class LightPropertyProvider : public PropertyProvider
+{
+public:
+    bool supports(Node* node) const override { return dynamic_cast<BaseLight*>(node) != nullptr; }
+
+    std::vector<PropertyInfo> list() const override
+    {
+        return {
+            {"intensity", PropertyType::Float, true},
+            {"range", PropertyType::Float, true},
+            {"direction", PropertyType::Vec3, true},
+        };
+    }
+
+    bool get(Node* node, std::string_view name, PropertyValue& out) const override
+    {
+        auto* light = dynamic_cast<BaseLight*>(node);
+        if (!light)
+            return false;
+
+        if (name == "intensity")
+        {
+            out = light->getIntensity();
+            return true;
+        }
+        if (name == "range")
+        {
+            if (auto* point = dynamic_cast<PointLight*>(node))
+            {
+                out = point->getRange();
+                return true;
+            }
+            if (auto* spot = dynamic_cast<SpotLight*>(node))
+            {
+                out = spot->getRange();
+                return true;
+            }
+            return false;
+        }
+        if (name == "direction")
+        {
+            if (auto* directional = dynamic_cast<DirectionLight*>(node))
+            {
+                out = directional->getDirection();
+                return true;
+            }
+            if (auto* spot = dynamic_cast<SpotLight*>(node))
+            {
+                out = spot->getDirection();
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    bool set(Node* node, std::string_view name, const PropertyValue& value) const override
+    {
+        auto* light = dynamic_cast<BaseLight*>(node);
+        if (!light)
+            return false;
+
+        if (name == "intensity")
+        {
+            if (!std::holds_alternative<float>(value))
+                return false;
+            light->setIntensity(std::get<float>(value));
+            return true;
+        }
+        if (name == "range")
+        {
+            if (!std::holds_alternative<float>(value))
+                return false;
+            if (auto* point = dynamic_cast<PointLight*>(node))
+            {
+                point->setRange(std::get<float>(value));
+                return true;
+            }
+            if (auto* spot = dynamic_cast<SpotLight*>(node))
+            {
+                spot->setRange(std::get<float>(value));
+                return true;
+            }
+            return false;
+        }
+        if (name == "direction")
+        {
+            if (!std::holds_alternative<Vec3>(value))
+                return false;
+            if (auto* directional = dynamic_cast<DirectionLight*>(node))
+            {
+                directional->setDirection(std::get<Vec3>(value));
+                return true;
+            }
+            if (auto* spot = dynamic_cast<SpotLight*>(node))
+            {
+                spot->setDirection(std::get<Vec3>(value));
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+};
+
+#endif  // AX_ENABLE_3D
+
 /// Appends the child-index path from `current` down to `target` (exclusive of `current`) onto
 /// `path`, backtracking on failed branches. Used by NodeReflection::pathOf.
 bool appendPathToDescendant(Node* current, Node* target, std::string& path)
@@ -458,6 +761,13 @@ NodeReflection::NodeReflection()
     addProvider("__NODE__", std::make_unique<NodePropertyProvider>());
     addProvider("__LABEL__", std::make_unique<LabelPropertyProvider>());
     addProvider("__SPRITE__", std::make_unique<SpritePropertyProvider>());
+#if defined(AX_ENABLE_3D)
+    // Registered after the 2D built-ins, so they are consulted BEFORE them. None of their names
+    // collide today, but the ordering is what makes a 3D-specific name win if one ever does.
+    addProvider("__MESH__", std::make_unique<MeshRendererPropertyProvider>());
+    addProvider("__CAMERA__", std::make_unique<CameraPropertyProvider>());
+    addProvider("__LIGHT__", std::make_unique<LightPropertyProvider>());
+#endif
 }
 
 NodeReflection* NodeReflection::getInstance()
@@ -555,6 +865,11 @@ NodeInfo NodeReflection::describe(Node* node, std::string_view path) const
     info.scaleX        = node->getScaleX();
     info.scaleY        = node->getScaleY();
     info.rotation       = node->getRotation();
+    // Depth, so a tree of nodes differing only in Z does not come back looking like a pile at one
+    // point. See the comment on NodeInfo::positionZ for why this is a scalar and not a Vec3.
+    info.positionZ      = node->getPositionZ();
+    info.scaleZ         = node->getScaleZ();
+    info.rotation3D     = node->getRotation3D();
     info.localZOrder    = node->getLocalZOrder();
     info.globalZOrder   = node->getGlobalZOrder();
     info.visible         = node->isVisible();

@@ -110,6 +110,14 @@ public:
     /** get mesh at index 0 which is the default mesh */
     Mesh* getMesh() const;
 
+    /** The model file this renderer was built from, or "" if it was created empty.
+
+        Recorded because the engine otherwise discards it, and geometry is fixed at construction:
+        anything that wants to REBUILD an equivalent renderer later - a scene serializer, an
+        editor, a tool - has no other way to learn which file to load. Mirrors what Sprite offers
+        through its texture's path. */
+    std::string_view getModelPath() const { return _modelPath; }
+
     /** get mesh count */
     ssize_t getMeshCount() const { return _meshes.size(); }
 
@@ -305,6 +313,10 @@ protected:
     * only for create mesh renderer
     */
     void setModelTexture(std::string_view modelPath, std::string_view texPath);
+
+    /// The path passed to initWithFile, kept so getModelPath() can answer. Empty for a renderer
+    /// built without a file.
+    std::string _modelPath;
 
     Skeleton3D* _skeleton;
 

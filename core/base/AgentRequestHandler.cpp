@@ -71,6 +71,9 @@ rapidjson::Value nodeInfoToJson(const NodeInfo& info, rapidjson::Document::Alloc
     obj.AddMember("scaleX", info.scaleX, allocator);
     obj.AddMember("scaleY", info.scaleY, allocator);
     obj.AddMember("rotation", info.rotation, allocator);
+    obj.AddMember("positionZ", info.positionZ, allocator);
+    obj.AddMember("scaleZ", info.scaleZ, allocator);
+    obj.AddMember("rotation3D", vec3ToJson(info.rotation3D, allocator), allocator);
     obj.AddMember("localZOrder", info.localZOrder, allocator);
     obj.AddMember("globalZOrder", info.globalZOrder, allocator);
     obj.AddMember("visible", info.visible, allocator);

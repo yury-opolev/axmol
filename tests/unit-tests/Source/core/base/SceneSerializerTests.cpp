@@ -211,9 +211,12 @@ TEST_CASE("a_camera_the_game_created_is_content_and_is_written")
     const auto json = serializeOrFail(root);
 
     CHECK(json.find("uiCamera") != std::string::npos);
-    // No factory can rebuild a Camera, so it is recorded as unsupported rather than dropped - the
-    // file keeps it, and a reader is told exactly what cannot be reconstructed.
-    CHECK(json.find("\"unsupported\":true") != std::string::npos);
+    // This used to assert "unsupported":true, which was correct while no factory could rebuild a
+    // Camera. Now that ax::Camera is registered the claim gets stronger rather than weaker: the
+    // camera is not merely preserved, it is reconstructible, and the fov it cannot be given after
+    // construction is captured in its creation parameters.
+    CHECK(json.find("\"unsupported\":true") == std::string::npos);
+    CHECK(json.find("fieldOfView") != std::string::npos);
 }
 
 TEST_CASE("a_path_still_addresses_the_same_node_after_a_round_trip")

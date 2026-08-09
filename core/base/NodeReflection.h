@@ -83,6 +83,17 @@ struct NodeInfo
     float scaleX       = 1.0f;
     float scaleY       = 1.0f;
     float rotation     = 0.0f;
+    /// Depth, reported separately rather than as a Vec3 position: `position` already carries x
+    /// and y, and shipping both forms would put the same two numbers in the payload twice - two
+    /// sources of truth in a document an agent reads and reasons about. The PROPERTY surface does
+    /// expose a whole-vector "position3D", because that side is about writing, where setting one
+    /// axis per round trip leaves the node visibly torn in between.
+    float positionZ    = 0.0f;
+    float scaleZ       = 1.0f;
+    /// Rotation about all three axes. Kept as a vector because, unlike position, it has no
+    /// existing partial form here: `rotation` above is the 2D rotation, which corresponds to z
+    /// only while skew is unused.
+    Vec3 rotation3D;
     int localZOrder    = 0;
     float globalZOrder = 0.0f;
     bool visible        = true;

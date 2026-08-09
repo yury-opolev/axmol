@@ -27,7 +27,9 @@
 #include "2d/Node.h"
 #include "base/NodeFactory.h"
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 using namespace ax;
 
@@ -204,3 +206,79 @@ TEST_CASE("a font path that escapes the resource root is refused")
                           error) == nullptr);
     CHECK(error.find("resource-relative") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 3D types. Gated exactly as the registrations are: with AX_ENABLE_3D off, core/3d is not
+// compiled at all (core/CMakeLists.txt:190), so these types do not exist and asserting on them
+// would break a legitimate build configuration.
+// ---------------------------------------------------------------------------------------------
+#if defined(AX_ENABLE_3D)
+
+TEST_CASE("factory_registers_the_3d_types")
+{
+    // The discoverability contract: axmol_scene_types reports registeredTypes(), so a type that
+    // is creatable but unregistered is one an agent has no way to find.
+    auto* factory = NodeFactory::getInstance();
+    CHECK(factory->isRegistered("ax::MeshRenderer"));
+    CHECK(factory->isRegistered("ax::Camera"));
+    CHECK(factory->isRegistered("ax::DirectionLight"));
+    CHECK(factory->isRegistered("ax::PointLight"));
+    CHECK(factory->isRegistered("ax::AmbientLight"));
+}
+
+TEST_CASE("mesh_renderer_requires_a_model_path")
+{
+    // Unlike a Label, which has a sensible default font, there is no such thing as a mesh with no
+    // model - so this must fail loudly at creation rather than produce an empty node that renders
+    // nothing and looks like a scene bug later.
+    std::string error;
+    auto* node = NodeFactory::getInstance()->create("ax::MeshRenderer", {}, error);
+    CHECK(node == nullptr);
+    CHECK(error.find("modelPath") != std::string::npos);
+}
+
+TEST_CASE("mesh_renderer_rejects_a_model_path_outside_the_resource_root")
+{
+    // Reaches the same ResourcePath allowlist that guards ax::Sprite's texture. A scene file is
+    // untrusted input in every build, so a model path out of one must not escape the sandbox.
+    std::string error;
+    auto* node = NodeFactory::getInstance()->create(
+        "ax::MeshRenderer", {{"modelPath", std::string("../../../etc/passwd")}}, error);
+    CHECK(node == nullptr);
+    CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("mesh_renderer_declares_its_creation_params_so_a_saved_scene_can_be_rebuilt")
+{
+    // A mesh's model is fixed at construction. If the serializer does not capture modelPath, a
+    // save/load round trip returns a node with no geometry - and reports success while doing it.
+    const auto params = NodeFactory::getInstance()->creationParams("ax::MeshRenderer");
+    CHECK(std::find(params.begin(), params.end(), "modelPath") != params.end());
+    CHECK(std::find(params.begin(), params.end(), "texturePath") != params.end());
+}
+
+TEST_CASE("lights_are_constructible_without_any_parameters")
+{
+    // Lights are plain nodes with no resource to load, so unlike Sprite/Label/MeshRenderer they
+    // can genuinely be built in a headless test - which makes this the one place the 3D creators
+    // are exercised rather than merely registered.
+    std::string error;
+    for (const auto* type : {"ax::DirectionLight", "ax::PointLight", "ax::AmbientLight"})
+    {
+        CAPTURE(type);
+        auto* node = NodeFactory::getInstance()->create(type, {}, error);
+        CHECK(node != nullptr);
+        CHECK(error.empty());
+    }
+}
+
+TEST_CASE("camera_declares_field_of_view_as_a_creation_param")
+{
+    // Camera has no setFieldOfView - createPerspective fixes it - so fov has to be captured at
+    // construction, the same reason ax::Label treats fontName as a creation param. Constructing a
+    // camera needs a live director and is covered against the running game instead.
+    const auto params = NodeFactory::getInstance()->creationParams("ax::Camera");
+    CHECK(std::find(params.begin(), params.end(), "fieldOfView") != params.end());
+}
+
+#endif  // AX_ENABLE_3D
