@@ -543,9 +543,22 @@ public:
             // several meshes, each with its own material - so this reports the first mesh's
             // diffuse texture, which is what a single-texture model (the case the factory's
             // texturePath parameter covers) has.
-            auto* firstMesh = mesh->getMesh();
-            auto* texture   = firstMesh ? firstMesh->getTexture() : nullptr;
-            out             = texture ? std::string(texture->getPath()) : std::string();
+            //
+            // The count is checked FIRST because getMesh() is _meshes.at(0), which THROWS on an
+            // empty renderer - and the root of a multi-object model is exactly that. Serialization
+            // reads texturePath for every MeshRenderer it walks, so without this guard saving any
+            // scene containing such a model failed outright with an out-of-range error from deep
+            // inside the engine.
+            auto* firstMesh = mesh->getMeshCount() > 0 ? mesh->getMesh() : nullptr;
+            // The USAGE overload, not the no-argument one. Mesh::getTexture() const is
+            // `_textures.at(Diffuse)` - a std::map::at that THROWS when the mesh has no diffuse
+            // texture, which is every mesh of an untextured model. Reading a property must not
+            // throw, and this one is read for every MeshRenderer the serializer walks, so the
+            // no-argument form made saving any scene containing an untextured model fail with
+            // "invalid map<K, T> key" from deep inside the engine. The usage overload is
+            // operator[], which yields null instead.
+            auto* texture = firstMesh ? firstMesh->getTexture(NTextureData::Usage::Diffuse) : nullptr;
+            out           = texture ? std::string(texture->getPath()) : std::string();
             return true;
         }
         if (name == "lightMask")

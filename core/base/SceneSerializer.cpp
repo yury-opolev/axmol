@@ -32,6 +32,10 @@
 #include "base/NodeFactory.h"
 #include "base/NodeReflection.h"
 #include "base/PropertyJson.h"
+#if defined(AX_ENABLE_3D)
+// For hasGeneratedChildren: a loaded model's children follow from its model path.
+#    include "3d/MeshRenderer.h"
+#endif
 
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
@@ -56,6 +60,28 @@ bool isEngineManagedNode(Node* node)
 
 namespace
 {
+
+/// Whether this node's children exist only because it loaded a model, and so must not be written.
+///
+/// A model with several named objects becomes one child MeshRenderer per object. Those children
+/// are not authored content: they follow from the model path recorded on the parent, and loading
+/// it again recreates them exactly. Only the parent carries that path, so writing them out emits
+/// MeshRenderers with an empty modelPath - which the loader then rejects, making the file
+/// unloadable while the save reported success.
+///
+/// Keyed on a non-empty model path rather than on "is a MeshRenderer with children": a
+/// MeshRenderer built in code and given children deliberately is ordinary content, and dropping
+/// those would lose real work.
+bool hasGeneratedChildren(Node* node)
+{
+#if defined(AX_ENABLE_3D)
+    auto* mesh = dynamic_cast<MeshRenderer*>(node);
+    return mesh && !mesh->getModelPath().empty();
+#else
+    (void)node;
+    return false;
+#endif
+}
 
 /// Deeper than any real scene, shallow enough that the recursion below cannot exhaust the stack.
 /// A scene file is DATA - it can arrive from anywhere, and this code is deliberately ungated so
@@ -157,13 +183,25 @@ rapidjson::Value serializeNode(Node* node,
     // it. Within the file the order is the render order, which is what matters for rebuilding.
     node->sortAllChildren();
     size_t index = 0;
-    for (auto* child : node->getChildren())
+    // A node whose children were BUILT BY LOADING ITS OWN MODEL contributes none of them to the
+    // file. Loading a model with several named objects produces one child MeshRenderer per object,
+    // so those children are not content anyone authored - they are a consequence of the model
+    // path already recorded above, and loading it again recreates them.
+    //
+    // Writing them anyway was actively broken, not merely wasteful: only the root carries the
+    // model path, so each generated child was emitted as an ax::MeshRenderer with an EMPTY
+    // modelPath, and the loader rejected the file it had just written with "modelPath must not be
+    // empty". The save reported success. Every such scene was unloadable.
+    if (!hasGeneratedChildren(node))
     {
-        if (child && !isEngineManagedNode(child))
+        for (auto* child : node->getChildren())
         {
-            children.PushBack(serializeNode(child, allocator, outWarnings, documentPath(path, index), depth + 1),
-                              allocator);
-            ++index;
+            if (child && !isEngineManagedNode(child))
+            {
+                children.PushBack(serializeNode(child, allocator, outWarnings, documentPath(path, index), depth + 1),
+                                  allocator);
+                ++index;
+            }
         }
     }
     obj.AddMember("children", children, allocator);

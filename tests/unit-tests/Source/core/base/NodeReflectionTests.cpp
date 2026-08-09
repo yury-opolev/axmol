@@ -979,3 +979,36 @@ TEST_SUITE("core/base/NodeReflection-pick")
     }
 }
 #endif  // AX_ENABLE_3D
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-emptymesh")
+{
+    TEST_CASE("every MeshRenderer property is safe on a renderer that owns no meshes")
+    {
+        // REGRESSION. texturePath called MeshRenderer::getMesh(), which is _meshes.at(0) and
+        // THROWS when empty - and the root of a multi-object model owns no meshes at all. The
+        // serializer reads texturePath for every MeshRenderer it walks, so saving any scene
+        // containing such a model died with an out-of-range error thrown from deep inside the
+        // engine, nowhere near the property that asked for it.
+        //
+        // Loops over the whole property list rather than naming texturePath, so a future property
+        // that also assumes a mesh exists is caught here rather than by a failed save.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        REQUIRE(mesh->getMeshCount() == 0);
+        mesh->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        for (const auto& property : reflection->listProperties(mesh))
+        {
+            CAPTURE(property.name);
+            PropertyValue value;
+            // The contract is "does not throw"; whether a given property has an answer for an
+            // empty renderer is its own business.
+            CHECK_NOTHROW(reflection->getProperty(mesh, property.name, value));
+        }
+
+        mesh->release();
+    }
+}
+#endif  // AX_ENABLE_3D
