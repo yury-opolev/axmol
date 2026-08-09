@@ -43,17 +43,6 @@ namespace ax
 // header just for a version string.
 extern const char* axmolVersion(void);
 
-bool pathEscapesWritableSandbox(std::string_view path)
-{
-    if (path.empty())
-        return false;
-    if (path.find("..") != std::string_view::npos)
-        return true;
-    if (path.front() == '/' || path.front() == '\\')
-        return true;
-    return path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':';
-}
-
 namespace
 {
 
@@ -173,6 +162,14 @@ bool DirectorSceneAccess::readTextFile(std::string_view file, std::string& outCo
         outError = "file name is required";
         return false;
     }
+    // Defence in depth, matching writeTextFile and captureScreenshot. AgentRequestHandler checks
+    // this before calling, but SceneAccess is an exported, reusable seam - the rule belongs here
+    // too rather than depending on every future caller having checked first.
+    if (pathEscapesWritableSandbox(file))
+    {
+        outError = "file escapes the resource path";
+        return false;
+    }
     // Read through FileUtils rather than the raw filesystem so a scene is found on the resource
     // search path (i.e. in Content/) like any other asset, and so a scene saved during development
     // loads the same way in a packaged build.
@@ -264,16 +261,55 @@ void DirectorSceneAccess::injectSwipe(float x1, float y1, float x2, float y2)
 
 void DirectorSceneAccess::setPaused(bool paused)
 {
+    // WHY NOT Director::pause(). Director::drawScene only calls Scheduler::update() when
+    // !_paused, and Scheduler::update() is the ONLY thing that drains the queue
+    // Scheduler::runOnAxmolThread posts to. AgentBridge marshals EVERY request through that
+    // queue, so pausing the Director stops the bridge from ever running another request - the
+    // resume that would undo it included. Verified against a live build: after director.pause,
+    // app.info and director.resume both time out, and the bridge is dead until the process is
+    // killed. Freezing the scene's own targets achieves what a caller wants from "pause" - a
+    // scene that stops changing under inspection - while leaving the marshalling pump alive.
+    //
+    // ACTIONS ARE COVERED BY THIS TOO, without a second call. Director schedules the
+    // ActionManager's update at PRIORITY_SYSTEM (Director.cpp: scheduleUpdate(_actionManager,
+    // PRIORITY_SYSTEM)), and pauseAllTargets() passes that same minimum, so the ActionManager's own
+    // entry is among the targets paused here and every running action stops with it.
+    //
+    // An earlier version ALSO called ActionManager::pauseAllRunningActions() and held the
+    // Vector<Node*> it returns. That was redundant, and it was not free: a Vector<Node*> RETAINS,
+    // so every node with a running action stayed alive for the whole pause. An agent that paused,
+    // deleted a node and resumed - an entirely ordinary sequence - kept the deleted subtree alive
+    // and detached until resume, and the set of raw target pointers had the mirror problem without
+    // even the retain. Pausing one scheduler entry has neither.
+    if (paused == _paused)
+        return;
+
     auto* director = Director::getInstance();
     if (paused)
-        director->pause();
+    {
+        _pausedTargets = director->getScheduler()->pauseAllTargets();
+    }
     else
-        director->resume();
+    {
+        // Resume exactly what we paused, rather than resuming everything: anything the game had
+        // already paused for its own reasons must stay paused.
+        director->getScheduler()->resumeTargets(_pausedTargets);
+        _pausedTargets.clear();
+    }
+    _paused = paused;
+}
+
+DirectorSceneAccess::~DirectorSceneAccess()
+{
+    // Leaving the game frozen with the only thing that could resume it being destroyed is not an
+    // acceptable teardown: the window would keep drawing a scene that never advances, and the
+    // bridge that offered director.resume is gone.
+    setPaused(false);
 }
 
 bool DirectorSceneAccess::isPaused() const
 {
-    return Director::getInstance()->isPaused();
+    return _paused;
 }
 
 std::string DirectorSceneAccess::getEngineVersion() const

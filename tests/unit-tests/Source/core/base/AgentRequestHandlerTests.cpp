@@ -27,8 +27,11 @@
 #include "base/AgentRequestHandler.h"
 #include "base/NodeReflection.h"
 #include "base/SceneAccess.h"
+#include "base/SceneSerializer.h"
 #include "2d/ActionInterval.h"
+#include "2d/Camera.h"
 #include "2d/Node.h"
+#include "2d/Scene.h"
 
 #include "rapidjson/document.h"
 
@@ -848,8 +851,15 @@ TEST_SUITE("core/base/AgentRequestHandler")
 
         REQUIRE(doc["ok"].GetBool());
         CHECK(moved->getParent() == target);
-        // The path it had going in no longer addresses it.
-        CHECK(std::string(doc["result"]["path"].GetString()) != "/0");
+
+        // The EXACT post-move path, not merely "different from the one I passed in": that weaker
+        // assertion passes against a handler that returns an empty string, the old parent's path,
+        // or anything else wrong. Reparenting renumbers two sibling lists at once, so this is the
+        // mutation whose reported path is easiest to get wrong.
+        const std::string reported(doc["result"]["path"].GetString());
+        CHECK(reported == NodeReflection::getInstance()->pathOf(f.root, moved));
+        // ...and following it must land back on the node that moved.
+        CHECK(NodeReflection::getInstance()->resolve(f.root, reported) == moved);
     }
 
     TEST_CASE("node_reparent_refuses_to_put_a_node_beneath_itself")
@@ -1108,6 +1118,102 @@ TEST_SUITE("core/base/AgentRequestHandler")
 
         REQUIRE_FALSE(doc["ok"].GetBool());
         CHECK(std::string(doc["error"]["message"].GetString()).find("game::MainScene") != std::string::npos);
+        // The SAME code node.create uses for the same condition: an agent that reacts to
+        // unknown_type by asking scene.types what it can build must recognise it here too.
+        CHECK_EQ(std::string("unknown_type"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("scene_load_distinguishes_a_malformed_file_from_an_unknown_type")
+    {
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene              = f.root;
+        access.files["bad.json"]  = R"({"format":"nope"})";
+        AgentRequestHandler handler(&access);
+
+        auto doc = sendRequest(handler, R"({"id":1,"method":"scene.load","params":{"file":"bad.json"}})");
+
+        REQUIRE_FALSE(doc["ok"].GetBool());
+        // invalid_params, not internal_error: the FILE is bad, and the file is the caller's. An
+        // agent told "internal_error" goes looking for an engine bug instead of at its own scene.
+        CHECK_EQ(std::string("invalid_params"), std::string(doc["error"]["code"].GetString()));
+    }
+
+    TEST_CASE("node_delete_and_reparent_refuse_an_engine_managed_node")
+    {
+        // A Scene's default Camera is an ordinary child, but Scene holds it in a RAW pointer whose
+        // only reference is the children array: removing it destroys the camera and leaves
+        // Scene::_defaultCamera dangling, to be dereferenced on the next projection change.
+        //
+        // A real Scene, not the plain-Node fixture: the rule is identity against
+        // Scene::getDefaultCamera(), so testing it against any old Camera would assert the wrong
+        // thing - see the companion case below, which is the half that was actually broken.
+        FakeSceneAccess access;
+        auto* scene = Scene::create();
+        REQUIRE(scene != nullptr);
+        auto* sibling = Node::create();
+        scene->addChild(sibling);
+        access.scene = scene;
+        auto* camera = scene->getDefaultCamera();
+        REQUIRE(camera != nullptr);
+        AgentRequestHandler handler(&access);
+
+        const std::string cameraPath = NodeReflection::getInstance()->pathOf(scene, camera);
+        REQUIRE_FALSE(cameraPath.empty());
+
+        auto deleted = sendRequest(
+            handler, std::string(R"({"id":1,"method":"node.delete","params":{"path":")") + cameraPath + R"("}})");
+        REQUIRE_FALSE(deleted["ok"].GetBool());
+        CHECK_EQ(std::string("invalid_params"), std::string(deleted["error"]["code"].GetString()));
+
+        const std::string siblingPath = NodeReflection::getInstance()->pathOf(scene, sibling);
+        auto moved                    = sendRequest(handler,
+                                 std::string(R"({"id":2,"method":"node.reparent","params":{"path":")") + cameraPath +
+                                     R"(","toPath":")" + siblingPath + R"("}})");
+        REQUIRE_FALSE(moved["ok"].GetBool());
+
+        // Still attached, which is the property that matters.
+        CHECK(camera->getParent() == scene);
+    }
+
+    TEST_CASE("a camera the GAME created is content, not an engine-managed node")
+    {
+        // The refusal above protects one object Scene owns by raw pointer. An earlier version
+        // spelled it "is a Camera", which also seized the game's own cameras - and a world/UI
+        // camera split is an ordinary Axmol pattern. Those became undeletable, unmovable, and were
+        // silently dropped from every saved scene: a rule meant to protect the engine's object
+        // quietly took ownership of the game's.
+        FakeSceneAccess access;
+        Fixture f;
+        access.scene   = f.root;
+        auto* uiCamera = Camera::create();
+        REQUIRE(uiCamera != nullptr);
+        uiCamera->setName("uiCamera");
+        f.root->addChild(uiCamera);
+        AgentRequestHandler handler(&access);
+
+        const std::string cameraPath = NodeReflection::getInstance()->pathOf(f.root, uiCamera);
+        REQUIRE_FALSE(cameraPath.empty());
+
+        auto deleted = sendRequest(
+            handler, std::string(R"({"id":1,"method":"node.delete","params":{"path":")") + cameraPath + R"("}})");
+        REQUIRE(deleted["ok"].GetBool());
+        CHECK(uiCamera->getParent() == nullptr);
+    }
+
+    TEST_CASE("a game's own camera survives a save round trip")
+    {
+        // The serializer skips engine-managed nodes. Under the old "is a Camera" rule that meant a
+        // game's second camera vanished from the file with no warning - the file looked complete.
+        Fixture f;
+        auto* uiCamera = Camera::create();
+        REQUIRE(uiCamera != nullptr);
+        uiCamera->setName("uiCamera");
+        f.root->addChild(uiCamera);
+
+        std::string json, error;
+        REQUIRE(SceneSerializer::serialize(f.root, json, error));
+        CHECK(json.find("uiCamera") != std::string::npos);
     }
 
     TEST_CASE("scene_load_rejects_an_unknown_mode")

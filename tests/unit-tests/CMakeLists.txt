@@ -39,6 +39,7 @@ set(GAME_SOURCE
     Source/core/base/MapTests.cpp
     Source/core/base/NodeFactoryTests.cpp
     Source/core/base/NodeReflectionTests.cpp
+    Source/core/base/ResourcePathTests.cpp
     Source/core/base/SceneSerializerTests.cpp
     Source/core/base/UTF8Tests.cpp
     Source/core/base/UtilsTests.cpp
@@ -62,6 +63,7 @@ if(AX_ENABLE_AGENT_BRIDGE)
   set(GAME_SOURCE ${GAME_SOURCE}
     Source/core/base/AgentBridgeFramingTests.cpp
     Source/core/base/AgentRequestHandlerTests.cpp
+    Source/core/base/SceneAccessTests.cpp
   )
 endif()
 

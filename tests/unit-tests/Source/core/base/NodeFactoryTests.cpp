@@ -155,3 +155,52 @@ TEST_CASE("find_param_locates_by_name")
     CHECK(std::get<std::string>(*findParam(params, "b")) == "two");
     CHECK(findParam(params, "missing") == nullptr);
 }
+
+TEST_CASE("a texture path that escapes the resource root is refused")
+{
+    // Ungated code: FileUtils::fullPathForFilename passes an absolute path through unchanged, so an
+    // unchecked texturePath means "render any image on this machine" - and with a screenshot tool
+    // on the other end of the bridge that is a file-disclosure primitive, not just untidiness.
+    auto* factory = NodeFactory::getInstance();
+
+    for (const char* texturePath : {"C:/windows/secret.png", "/etc/passwd", "../../secret.png",
+                                    "a; whoami #.png", "shot.png:hidden"})
+    {
+        INFO("texturePath: " << texturePath);
+        std::string error;
+        CHECK(factory->create("ax::Sprite", {{"texturePath", std::string(texturePath)}}, error) == nullptr);
+        CHECK(error.find("resource-relative") != std::string::npos);
+    }
+}
+
+TEST_CASE("the font axmol actually ships is not rejected by the path rule")
+{
+    // The regression the space allowance in ResourcePath exists for, asserted at the layer that
+    // consumes it: the engine's own default font is "fonts/Marker Felt.ttf", so a rule that
+    // refuses a space makes every Label unbuildable from a scene file. Caught originally by the
+    // live round-trip smoke test.
+    //
+    // Deliberately NOT asserting the label is built. Whether this binary can resolve that TTF
+    // depends on its resource search path, which is not what this test is about - and pinning it
+    // would make the test fail for a reason that has nothing to do with the rule. What must never
+    // happen is a rejection by the PATH check.
+    auto* factory = NodeFactory::getInstance();
+    std::string error;
+    factory->create("ax::Label",
+                    {{"text", std::string("hello")},
+                     {"fontName", std::string("fonts/Marker Felt.ttf")},
+                     {"fontSize", 24.0f}},
+                    error);
+    CHECK(error.find("resource-relative") == std::string::npos);
+}
+
+TEST_CASE("a font path that escapes the resource root is refused")
+{
+    auto* factory = NodeFactory::getInstance();
+    std::string error;
+    CHECK(factory->create("ax::Label",
+                          {{"text", std::string("hi")}, {"fontName", std::string("C:/windows/fonts/arial.ttf")},
+                           {"fontSize", 24.0f}},
+                          error) == nullptr);
+    CHECK(error.find("resource-relative") != std::string::npos);
+}

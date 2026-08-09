@@ -81,12 +81,17 @@ set(_AX_BASE_HEADER
   base/PaddedString.h
   base/JsonWriter.h
   base/JobSystem.h
-  base/NodeReflection.h
-  # Ungated, unlike the agent bridge: a game that ships a scene saved during development must be
-  # able to LOAD it in a release build, so scene reading is an ordinary engine capability. Only
-  # WRITING one from a socket stays debug-only, inside AgentRequestHandler.
+
+  # The group below is ungated, unlike the agent bridge: a game that ships a scene saved during
+  # development must be able to LOAD it in a release build, so scene reading is an ordinary engine
+  # capability. Only WRITING one from a socket stays debug-only, inside AgentRequestHandler.
+  # ResourcePath is here rather than with the bridge for the same reason - NodeFactory validates
+  # asset paths out of untrusted scene files, in every build. NodeReflection belongs here too:
+  # SceneSerializer reads and applies properties through it on every load.
   base/NodeFactory.h
+  base/NodeReflection.h
   base/PropertyJson.h
+  base/ResourcePath.h
   base/SceneSerializer.h
 )
 
@@ -143,9 +148,10 @@ set(_AX_BASE_SRC
   base/pvr.cpp
   base/s3tc.cpp
   base/astc.cpp
-  base/NodeReflection.cpp
   base/NodeFactory.cpp
+  base/NodeReflection.cpp
   base/PropertyJson.cpp
+  base/ResourcePath.cpp
   base/SceneSerializer.cpp
   ${_AX_BASE_SPECIFIC_SRC}
 )

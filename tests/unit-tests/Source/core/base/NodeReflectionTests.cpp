@@ -26,6 +26,7 @@
 
 #include "base/NodeReflection.h"
 #include "2d/Node.h"
+#include "fmt/format.h"
 
 #include <memory>
 #include <string>
@@ -144,6 +145,54 @@ public:
 
 TEST_SUITE("core/base/NodeReflection")
 {
+    TEST_CASE("node_ids_are_opaque_handles_not_addresses")
+    {
+        // The id used to be the raw pointer, which every scene.tree response then handed to whoever
+        // was on the other end of the bridge: a live heap address per node, i.e. an ASLR defeat
+        // given away for free, and the missing half of an exploit for any use-after-free elsewhere.
+        auto* node       = Node::create();
+        auto* other      = Node::create();
+        auto* reflection = NodeReflection::getInstance();
+
+        const auto id = reflection->describe(node).id;
+
+        CHECK_FALSE(id.empty());
+        // Stable within a run - the one property the id is documented to have.
+        CHECK(id == reflection->describe(node).id);
+        CHECK(id != reflection->describe(other).id);
+
+        // ...and not the address, in any of the obvious spellings.
+        const auto address    = reinterpret_cast<uintptr_t>(node);
+        const auto lowercase  = fmt::format("{:x}", address);
+        const auto uppercase  = fmt::format("{:X}", address);
+        const auto pointerFmt = fmt::format("{}", fmt::ptr(node));
+        CHECK(id.find(lowercase) == std::string::npos);
+        CHECK(id.find(uppercase) == std::string::npos);
+        CHECK(id != pointerFmt);
+    }
+
+    TEST_CASE("node_ids_do_not_leak_the_distance_between_two_nodes")
+    {
+        // The checks above pass for `addr ^ salt`, which is what the implementation ACTUALLY was on
+        // every non-MSVC target: std::hash<T*> is the identity function in libstdc++ and libc++, so
+        // hashing the pointer hashed nothing. Under that scheme any two ids XOR to the exact
+        // distance between their nodes on the heap, and one known address recovers the salt and
+        // therefore all of them - so the ids were an ASLR oracle while looking opaque.
+        //
+        // This is the property that distinguishes a real mixer from an XOR, and it is the reason
+        // the mixing is written out by hand instead of delegated to std::hash.
+        auto* first      = Node::create();
+        auto* second     = Node::create();
+        auto* reflection = NodeReflection::getInstance();
+
+        const auto idDelta = std::stoull(reflection->describe(first).id, nullptr, 16) ^
+                             std::stoull(reflection->describe(second).id, nullptr, 16);
+        const auto addressDelta = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(first)) ^
+                                  static_cast<uint64_t>(reinterpret_cast<uintptr_t>(second));
+
+        CHECK(idDelta != addressDelta);
+    }
+
     TEST_CASE("type_name_is_demangled")
     {
         auto node = Node::create();

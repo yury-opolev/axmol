@@ -659,6 +659,16 @@ bool handleNodeDelete(SceneAccess* access,
         return false;
     }
 
+    // A Scene's default Camera is an ordinary child, so it is addressable - but Scene keeps it in
+    // a RAW pointer whose only reference is the children array. Removing it destroys the camera
+    // and leaves Scene::_defaultCamera dangling, to be dereferenced on the next projection change.
+    if (isEngineManagedNode(node))
+    {
+        code    = "invalid_params";
+        message = "refusing to delete an engine-managed node (the scene owns it)";
+        return false;
+    }
+
     node->removeFromParent();
     result.SetObject();
     return true;
@@ -691,6 +701,14 @@ bool handleNodeReparent(SceneAccess* access,
     {
         code    = "invalid_params";
         message = "refusing to reparent the running scene";
+        return false;
+    }
+    // Same ownership problem as node.delete: moving a scene's default camera off it leaves
+    // Scene::_defaultCamera pointing at a node the scene no longer owns.
+    if (isEngineManagedNode(node))
+    {
+        code    = "invalid_params";
+        message = "refusing to reparent an engine-managed node (the scene owns it)";
         return false;
     }
     if (node == newParent)
@@ -790,7 +808,8 @@ bool handleSceneSave(SceneAccess* access,
         return false;
 
     std::string json, serializeError;
-    if (!SceneSerializer::serialize(node, json, serializeError))
+    std::vector<std::string> warnings;
+    if (!SceneSerializer::serialize(node, json, serializeError, &warnings))
     {
         code    = "internal_error";
         message = serializeError;
@@ -808,6 +827,10 @@ bool handleSceneSave(SceneAccess* access,
     result.SetObject();
     result.AddMember("path", jsonString(outPath, doc.GetAllocator()), doc.GetAllocator());
     result.AddMember("bytes", static_cast<int>(json.size()), doc.GetAllocator());
+    // Reported the same way scene.load reports its own, and always present so a caller does not
+    // have to distinguish "no warnings" from "this build does not report them". A save that
+    // dropped part of the tree must not be indistinguishable from one that did not.
+    result.AddMember("warnings", jsonStringArray(warnings, doc.GetAllocator()), doc.GetAllocator());
     return true;
 }
 
@@ -910,27 +933,39 @@ bool handleSceneLoad(SceneAccess* access,
     std::vector<std::string> warnings;
     std::vector<Node*> loadedChildren;
     Node* loadedRoot = nullptr;
+    auto failure     = SceneSerializer::LoadFailure::None;
 
-    if (contentsOnly)
+    const bool loaded = contentsOnly
+                            ? SceneSerializer::deserializeChildren(json, options, loadedChildren, loadError,
+                                                                   warnings, &failure)
+                            : (loadedRoot = SceneSerializer::deserialize(json, options, loadError, warnings,
+                                                                          &failure)) != nullptr;
+    if (!loaded)
     {
-        if (!SceneSerializer::deserializeChildren(json, options, loadedChildren, loadError, warnings))
+        // "This build cannot make an ax::Menu" gets the SAME code here as it does from
+        // node.create. An agent that special-cases unknown_type by asking scene.types what it can
+        // make would otherwise fail to recognise the identical problem arriving through a load.
+        //
+        // A malformed file is invalid_params, not internal_error. It is the caller's file and the
+        // caller's choice of file, and the serializer's message names the offending node - so it
+        // is both their fault and theirs to fix. Reporting it as internal_error says "the engine
+        // is broken", which sends an agent looking in exactly the wrong place; that is not a
+        // hypothetical, it is what a bad fontName in a saved scene actually looked like.
+        // CreationFailed keeps internal_error: a registered type that will not build IS ours.
+        switch (failure)
         {
-            code    = "internal_error";
-            message = loadError;
-            return false;
+        case SceneSerializer::LoadFailure::UnknownType:
+            code = "unknown_type";
+            break;
+        case SceneSerializer::LoadFailure::Malformed:
+            code = "invalid_params";
+            break;
+        default:
+            code = "internal_error";
+            break;
         }
-    }
-    else
-    {
-        loadedRoot = SceneSerializer::deserialize(json, options, loadError, warnings);
-        if (!loadedRoot)
-        {
-            // The scene file is data, not a request, so a bad one is not invalid_params - but the
-            // message carries the serializer's own explanation, which names the offending node.
-            code    = "internal_error";
-            message = loadError;
-            return false;
-        }
+        message = loadError;
+        return false;
     }
 
     // Only now that the whole tree is built is anything in the live scene touched: a failed load
@@ -953,10 +988,7 @@ bool handleSceneLoad(SceneAccess* access,
     result.AddMember("path", jsonString(pathWithinScene(access, contentsOnly ? parent : loadedRoot), allocator),
                      allocator);
     result.AddMember("nodesAdded", static_cast<int>(contentsOnly ? loadedChildren.size() : 1u), allocator);
-    rapidjson::Value warningsJson(rapidjson::kArrayType);
-    for (const auto& warning : warnings)
-        warningsJson.PushBack(jsonString(warning, allocator), allocator);
-    result.AddMember("warnings", warningsJson, allocator);
+    result.AddMember("warnings", jsonStringArray(warnings, allocator), allocator);
     return true;
 }
 

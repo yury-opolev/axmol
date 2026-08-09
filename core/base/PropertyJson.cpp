@@ -38,6 +38,15 @@ rapidjson::Value jsonString(std::string_view s, rapidjson::Document::AllocatorTy
     return v;
 }
 
+rapidjson::Value jsonStringArray(const std::vector<std::string>& values,
+                                 rapidjson::Document::AllocatorType& allocator)
+{
+    rapidjson::Value array(rapidjson::kArrayType);
+    for (const auto& value : values)
+        array.PushBack(jsonString(value, allocator), allocator);
+    return array;
+}
+
 rapidjson::Value vec2ToJson(const Vec2& v, rapidjson::Document::AllocatorType& allocator)
 {
     rapidjson::Value obj(rapidjson::kObjectType);

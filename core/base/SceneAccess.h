@@ -26,10 +26,13 @@
 
 #include <atomic>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 
 #include "base/Macros.h"
+#include "base/ResourcePath.h"
+#include "base/Vector.h"
 #include "math/Vec2.h"
 
 namespace ax
@@ -37,17 +40,9 @@ namespace ax
 
 class Node;
 
-/** True if `path` could escape a writable-directory sandbox when joined onto it: an absolute
-    path (leading '/' or '\\', or a drive letter like "C:") or a relative path containing a ".."
-    segment. Shared by AgentRequestHandler's "screenshot" validation and
-    DirectorSceneAccess::captureScreenshot (defense in depth - see the design doc §5 requirement
-    that a client can never write outside the sandbox), so there is exactly one implementation of
-    this rule instead of two independently-written checks that can quietly drift apart.
-    Deliberately syntactic only - no FileUtils / real-filesystem dependency - so
-    AgentRequestHandler, which must stay engine-free and unit-testable with a FakeSceneAccess and
-    no live FileUtils (see its class comment), can call it too. An empty `path` never escapes
-    (callers treat empty as "use a default name"). */
-AX_DLL bool pathEscapesWritableSandbox(std::string_view path);
+// NOTE: pathEscapesWritableSandbox now lives in ResourcePath.h (included above) - an UNGATED
+// header, because NodeFactory needs the same rule for asset paths read out of untrusted scene
+// files and is compiled into every build. Including it here keeps existing callers working.
 
 /** Everything AgentRequestHandler needs from a live engine, abstracted behind an interface so
     the handler can be unit-tested with no Director, no window and no GPU. AgentBridge (a
@@ -79,10 +74,18 @@ public:
         line, and a touch-up at (x2,y2) - the same shape Console's `touch swipe` produces. */
     virtual void injectSwipe(float x1, float y1, float x2, float y2) = 0;
 
-    /** Pauses or resumes the Director's scheduler/animation. */
+    /** Freezes or resumes the running scene's actions and scheduled updates, so it can be
+        inspected or screenshotted without changing underneath the caller.
+
+        NOT Director::pause(). That would be a trap: Director::pause() sets _paused, and
+        Director::drawScene only calls Scheduler::update() when !_paused - while
+        Scheduler::update() is the ONLY thing that drains the queue runOnAxmolThread posts to.
+        Since AgentBridge marshals every request through that queue, pausing the Director stops
+        the bridge from ever executing another request, including the resume that would undo it.
+        Freezing the scene's targets instead leaves the pump running. */
     virtual void setPaused(bool paused) = 0;
 
-    /** Whether the Director is currently paused. */
+    /** Whether the scene is currently frozen by setPaused(). */
     virtual bool isPaused() const = 0;
 
     /** The engine version string, e.g. what Console's `version` command prints. */
@@ -125,6 +128,10 @@ public:
 class AX_DLL DirectorSceneAccess : public SceneAccess
 {
 public:
+    /** Resumes the scene if this object paused it. Being destroyed while holding the game frozen
+        would leave it frozen for good - the thing that offered director.resume is gone. */
+    ~DirectorSceneAccess() override;
+
     Node* getRunningScene() override;
     bool captureScreenshot(std::string_view file, std::string& outPath, std::string& outError) override;
     void injectTap(float x, float y) override;
@@ -150,6 +157,13 @@ private:
     // instead of capturing `this` and risking a dangling-pointer callback (the same hazard, and
     // the same fix, as AgentBridge's _handlerAlive).
     std::shared_ptr<std::atomic<bool>> _captureInProgress = std::make_shared<std::atomic<bool>>(false);
+
+    // What setPaused(true) froze, so setPaused(false) can resume exactly that and nothing else.
+    // Scheduler targets only - the ActionManager is itself one of them, so actions come along for
+    // free. Holding the Vector<Node*> that ActionManager::pauseAllRunningActions() returns would
+    // RETAIN every node with a running action for the duration of the pause; see setPaused().
+    bool _paused = false;
+    std::set<void*> _pausedTargets;
 };
 
 }  // namespace ax

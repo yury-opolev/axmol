@@ -25,11 +25,13 @@
 #include "base/NodeFactory.h"
 
 #include <algorithm>
+#include <atomic>
 
 #include "2d/Label.h"
 #include "2d/Layer.h"  // LayerColor lives here
 #include "2d/Node.h"
 #include "2d/Sprite.h"
+#include "base/ResourcePath.h"  // pathEscapesWritableSandbox - the one path-escape rule
 
 namespace ax
 {
@@ -37,7 +39,7 @@ namespace ax
 namespace
 {
 
-NodeFactory* s_instance = nullptr;
+std::atomic<NodeFactory*> s_instance{nullptr};
 
 /// Reads an optional string parameter. Returns false only when the name IS present but holds
 /// something other than a string - an absent optional parameter is not an error.
@@ -99,6 +101,23 @@ bool requiredString(const PropertyBag& params, std::string_view name, std::strin
     return true;
 }
 
+/// Rejects an asset path that leaves the project's resources.
+///
+/// A scene file is untrusted data and this layer is ungated, so it runs in release builds too.
+/// FileUtils::fullPathForFilename returns an absolute path unchanged, which means an unchecked
+/// texturePath is "render any image on this machine" - and with a screenshot tool on the other end
+/// of the bridge, that is a file-disclosure primitive. Assets live under the resource root; a
+/// value that starts at the filesystem root or climbs out of it is not an asset reference.
+bool isResourceRelativePath(std::string_view path, std::string& outError)
+{
+    if (pathEscapesWritableSandbox(path))
+    {
+        outError = "\"" + std::string(path) + "\" must be a resource-relative path";
+        return false;
+    }
+    return true;
+}
+
 bool endsWith(std::string_view text, std::string_view suffix)
 {
     return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
@@ -115,15 +134,28 @@ const PropertyValue* findParam(const PropertyBag& params, std::string_view name)
 
 NodeFactory* NodeFactory::getInstance()
 {
-    if (!s_instance)
-        s_instance = new NodeFactory();
-    return s_instance;
+    // Same construction as NodeReflection::getInstance(), deliberately: these two are singletons of
+    // the same kind, called from the same functions (serializeNode, handleNodeCreate), and having
+    // one of them be thread-safe while the other is not would be a distinction nobody could
+    // justify later. A compare-exchange rather than std::call_once because destroyInstance() has to
+    // work - a once-flag cannot express "again".
+    auto* existing = s_instance.load(std::memory_order_acquire);
+    if (existing)
+        return existing;
+
+    auto* created = new NodeFactory();
+    if (s_instance.compare_exchange_strong(existing, created, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return created;
+    }
+
+    delete created;
+    return existing;
 }
 
 void NodeFactory::destroyInstance()
 {
-    delete s_instance;
-    s_instance = nullptr;
+    delete s_instance.exchange(nullptr, std::memory_order_acq_rel);
 }
 
 NodeFactory::NodeFactory()
@@ -134,6 +166,8 @@ NodeFactory::NodeFactory()
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      std::string texturePath;
                      if (!requiredString(params, "texturePath", texturePath, outError))
+                         return nullptr;
+                     if (!isResourceRelativePath(texturePath, outError))
                          return nullptr;
 
                      auto* sprite = Sprite::create(texturePath);
@@ -168,6 +202,9 @@ NodeFactory::NodeFactory()
                          outError = "\"fontSize\" must be greater than zero";
                          return nullptr;
                      }
+
+                     if (!fontName.empty() && !isResourceRelativePath(fontName, outError))
+                         return nullptr;
 
                      // A .ttf name is a font FILE and must go through createWithTTF;
                      // createWithSystemFont would treat it as a system font family name and

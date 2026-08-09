@@ -39,16 +39,18 @@
 #include "fmt/format.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
+#include <cstdint>
 #include <cstdlib>
-#include <mutex>
+#include <random>
 
 namespace ax
 {
 
 namespace
 {
-NodeReflection* g_instance = nullptr;
+std::atomic<NodeReflection*> g_instance{nullptr};
 
 // ---------------------------------------------------------------------------------------------
 // Built-in providers. These are the data-oriented equivalents of Inspector's three
@@ -265,6 +267,37 @@ std::string asResourceRelativePath(std::string_view absolute)
     return path;
 }
 
+/// A correlation handle for a node, stable within one process run.
+///
+/// NOT the address. NodeInfo::id used to be the raw pointer, which every scene.tree response then
+/// handed to whoever was on the other end of the bridge - a live heap address per node, i.e. an
+/// ASLR defeat handed out for free, and exactly the missing half of an exploit for any
+/// use-after-free elsewhere. Mixing against a per-run salt keeps the only property the id is
+/// documented to have (the same node compares equal within a session) and discards the one it
+/// should never have had.
+///
+/// The mixing is written out by hand rather than left to std::hash. std::hash<T*> is the IDENTITY
+/// function in libstdc++ and libc++ - only MSVC's STL actually hashes it - so `std::hash<T*>{}(p) ^
+/// salt` degrades to `addr ^ salt` on Android, Linux and macOS. That is not obfuscation: any two
+/// ids XOR to the exact distance between their nodes on the heap, and one node whose address is
+/// known by other means recovers the salt and with it every address in the process. splitmix64 is
+/// a real finalizer, so a single id reveals nothing and pairs of ids reveal nothing.
+std::string opaqueNodeId(const Node* node)
+{
+    // 64-bit regardless of pointer width: a 32-bit target (armeabi-v7a) must not end up with a
+    // 32-bit salt, and shifting a 32-bit size_t left by 32 would be undefined anyway.
+    static const uint64_t salt = [] {
+        std::random_device device;
+        return (static_cast<uint64_t>(device()) << 32) ^ static_cast<uint64_t>(device());
+    }();
+
+    uint64_t mixed = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(node)) + salt;
+    mixed          = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    mixed          = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+    mixed          = mixed ^ (mixed >> 31);
+    return fmt::format("{:016x}", mixed);
+}
+
 class SpritePropertyProvider : public PropertyProvider
 {
 public:
@@ -429,15 +462,34 @@ NodeReflection::NodeReflection()
 
 NodeReflection* NodeReflection::getInstance()
 {
-    static std::once_flag onceFlag;
-    std::call_once(onceFlag, [] { g_instance = new NodeReflection(); });
-    return g_instance;
+    // A compare-exchange rather than std::call_once. With call_once, destroyInstance() left the
+    // flag set, so the next getInstance() returned the null pointer it had just stored - and every
+    // caller dereferences the result unconditionally. Destroy-then-use is exactly what a test that
+    // wants a clean registry does, so the pair has to actually work; a once-flag cannot express
+    // "again".
+    //
+    // The class is reached only from the Axmol main thread, so this is belt-and-braces. It is
+    // cheap belt-and-braces, and an invariant enforced by a comment is one that a future caller on
+    // the bridge thread breaks silently.
+    auto* existing = g_instance.load(std::memory_order_acquire);
+    if (existing)
+        return existing;
+
+    auto* created = new NodeReflection();
+    if (g_instance.compare_exchange_strong(existing, created, std::memory_order_acq_rel,
+                                           std::memory_order_acquire))
+    {
+        return created;
+    }
+
+    // Someone else won the race; theirs is the one everybody must see.
+    delete created;
+    return existing;
 }
 
 void NodeReflection::destroyInstance()
 {
-    delete g_instance;
-    g_instance = nullptr;
+    delete g_instance.exchange(nullptr, std::memory_order_acq_rel);
 }
 
 #if defined(_MSC_VER)
@@ -490,7 +542,7 @@ NodeInfo NodeReflection::describe(Node* node, std::string_view path) const
     if (!node)
         return info;
 
-    info.id          = fmt::format("{}", fmt::ptr(node));
+    info.id          = opaqueNodeId(node);
     info.path         = std::string(path);
     info.typeName     = getTypeName(node);
     info.name         = std::string(node->getName());

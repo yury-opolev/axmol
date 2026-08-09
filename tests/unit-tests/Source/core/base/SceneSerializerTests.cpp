@@ -24,7 +24,9 @@
 
 #include <doctest.h>
 
+#include "2d/Camera.h"
 #include "2d/Node.h"
+#include "2d/Scene.h"
 #include "base/NodeFactory.h"
 #include "base/NodeReflection.h"
 #include "base/SceneSerializer.h"
@@ -137,6 +139,81 @@ TEST_CASE("round_trip_preserves_tree_shape_and_child_order")
     CHECK(loaded->getChildren().at(2)->getName() == "child2");
     REQUIRE(loaded->getChildren().at(1)->getChildrenCount() == 1);
     CHECK(loaded->getChildren().at(1)->getChildren().at(0)->getName() == "deep");
+}
+
+TEST_CASE("children_are_written_in_render_order_not_insertion_order")
+{
+    // Every other ordering test builds children with ASCENDING z, which makes sorted order and
+    // insertion order identical - so deleting sortAllChildren() from the serializer keeps them all
+    // green. Descending z is the only arrangement that can tell the two apart.
+    auto* root = Node::create();
+    for (int i = 0; i < 3; ++i)
+    {
+        auto* child = Node::create();
+        child->setName("added" + std::to_string(i));
+        child->setLocalZOrder(2 - i);  // added0 is drawn LAST
+        root->addChild(child);
+    }
+
+    std::vector<std::string> warnings;
+    auto* loaded = deserializeOrFail(serializeOrFail(root), warnings);
+
+    REQUIRE(loaded->getChildrenCount() == 3);
+    loaded->sortAllChildren();
+    CHECK(loaded->getChildren().at(0)->getName() == "added2");
+    CHECK(loaded->getChildren().at(1)->getName() == "added1");
+    CHECK(loaded->getChildren().at(2)->getName() == "added0");
+}
+
+TEST_CASE("a_scenes_own_default_camera_is_left_out_of_the_file")
+{
+    // The rule this guards was itself a defect found only by the end-to-end script: a Scene writes
+    // its own default Camera into the file, and loading then adds a second camera to a scene that
+    // already has one.
+    //
+    // A real Scene, not a plain Node with a Camera stuck under it. The predicate is identity
+    // against Scene::getDefaultCamera(), because "engine-managed" means "Scene owns this by raw
+    // pointer" - see the companion case below for the half that distinction protects.
+    auto* scene   = Scene::create();
+    REQUIRE(scene != nullptr);
+    auto* content = Node::create();
+    content->setName("content");
+    scene->addChild(content);
+
+    const auto json = serializeOrFail(scene);
+
+    CHECK(json.find("ax::Camera") == std::string::npos);
+    CHECK(json.find("content") != std::string::npos);
+
+    // deserializeChildren, not deserialize: the root of a whole-scene file is the game's own Scene
+    // type, which no factory can rebuild. That is the case `mode: contents` exists for, and it is
+    // what scene.load actually does with a file like this one.
+    std::vector<Node*> children;
+    std::string loadError;
+    std::vector<std::string> warnings;
+    REQUIRE(SceneSerializer::deserializeChildren(json, {}, children, loadError, warnings));
+    // Exactly one: "content". The camera was never written, so nothing tries to rebuild it and no
+    // second camera arrives in a scene that already has its own.
+    CHECK(children.size() == 1);
+}
+
+TEST_CASE("a_camera_the_game_created_is_content_and_is_written")
+{
+    // The other half. An earlier isEngineManagedNode said "is a Camera", which also swallowed
+    // cameras the GAME made - and a world/UI camera split is an ordinary Axmol pattern. Those
+    // vanished from every saved scene with no warning at all: the file looked complete.
+    auto* root     = Node::create();
+    auto* uiCamera = Camera::create();
+    REQUIRE(uiCamera != nullptr);
+    uiCamera->setName("uiCamera");
+    root->addChild(uiCamera);
+
+    const auto json = serializeOrFail(root);
+
+    CHECK(json.find("uiCamera") != std::string::npos);
+    // No factory can rebuild a Camera, so it is recorded as unsupported rather than dropped - the
+    // file keeps it, and a reader is told exactly what cannot be reconstructed.
+    CHECK(json.find("\"unsupported\":true") != std::string::npos);
 }
 
 TEST_CASE("a_path_still_addresses_the_same_node_after_a_round_trip")
@@ -453,4 +530,47 @@ TEST_CASE("a_failed_child_fails_the_whole_load")
     CHECK(error.find("ax::NoSuchType") != std::string::npos);
     // The error names where it failed, not just what failed.
     CHECK(error.find("/1") != std::string::npos);
+}
+
+TEST_CASE("a tree deeper than the cap is truncated into a file that still LOADS")
+{
+    // The point of truncating rather than failing is that the caller gets a usable file - their
+    // scene is not something they can be asked to fix. The first version emitted the marker one
+    // level BELOW the cap and kept the original type, so the save reported success and the
+    // resulting file was rejected by the loader every time: a silent, unrecoverable save.
+    Node* root    = Node::create();
+    Node* deepest = root;
+    for (int i = 0; i < 200; ++i)
+    {
+        Node* child = Node::create();
+        deepest->addChild(child);
+        deepest = child;
+    }
+
+    std::string json, error;
+    std::vector<std::string> saveWarnings;
+    REQUIRE(SceneSerializer::serialize(root, json, error, &saveWarnings));
+
+    // Truncation is REPORTED. A save that quietly dropped 70 levels is indistinguishable from one
+    // that did not, which is the whole failure mode.
+    CHECK_FALSE(saveWarnings.empty());
+    CHECK(saveWarnings.front().find("truncated") != std::string::npos);
+
+    std::string loadError;
+    std::vector<std::string> loadWarnings;
+    Node* reloaded = SceneSerializer::deserialize(json, {}, loadError, loadWarnings);
+    CHECK(reloaded != nullptr);
+    CHECK(loadError.empty());
+}
+
+TEST_CASE("a shallow tree is not truncated and reports nothing")
+{
+    Node* root = Node::create();
+    root->addChild(Node::create());
+
+    std::string json, error;
+    std::vector<std::string> warnings;
+    REQUIRE(SceneSerializer::serialize(root, json, error, &warnings));
+    CHECK(warnings.empty());
+    CHECK(json.find("truncated") == std::string::npos);
 }

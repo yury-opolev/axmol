@@ -70,7 +70,8 @@ struct PropertyInfo
     hand across a process boundary. */
 struct NodeInfo
 {
-    std::string id;        ///< node pointer as hex - correlation only, never an input to a lookup
+    std::string id;        ///< opaque per-run handle - correlation only, never an input to a lookup
+                           ///< and deliberately NOT the node's address (see opaqueNodeId)
     std::string path;       ///< canonical child-index path, e.g. "/0/2"
     std::string typeName;   ///< demangled RTTI type name, e.g. "ax::Sprite"
     std::string name;       ///< Node::getName()

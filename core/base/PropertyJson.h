@@ -26,6 +26,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "base/Macros.h"
 #include "base/NodeReflection.h"
@@ -55,6 +56,13 @@ namespace ax
 
 /** Builds a JSON string value that owns its bytes. */
 AX_DLL rapidjson::Value jsonString(std::string_view s, rapidjson::Document::AllocatorType& allocator);
+
+/** Builds a JSON array of strings that owns its bytes. Both scene.save and scene.load report a
+    "warnings" array, and they must report it identically - including emitting an empty array
+    rather than omitting the member, so a caller never has to tell "nothing to report" apart from
+    "this build does not report". */
+AX_DLL rapidjson::Value jsonStringArray(const std::vector<std::string>& values,
+                                        rapidjson::Document::AllocatorType& allocator);
 
 AX_DLL rapidjson::Value vec2ToJson(const Vec2& v, rapidjson::Document::AllocatorType& allocator);
 AX_DLL rapidjson::Value vec3ToJson(const Vec3& v, rapidjson::Document::AllocatorType& allocator);

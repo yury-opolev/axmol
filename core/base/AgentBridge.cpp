@@ -206,7 +206,16 @@ AgentBridge::~AgentBridge()
 
 bool AgentBridge::listen(int port)
 {
-#ifndef __EMSCRIPTEN__
+#if !defined(_AX_DEBUG) || _AX_DEBUG == 0
+    // Belt and braces with the AX_ENABLE_AGENT_BRIDGE build option. That option defaults ON and is
+    // not tied to the configuration, so the surface compiles into release builds of this fork; a
+    // single listen() call - in a game's own code, or copied from a template - would then expose
+    // it in a shipped binary. _AX_DEBUG is defined per-configuration, so this cannot be turned on
+    // by a build flag.
+    (void)port;
+    AXLOGE("AgentBridge: refusing to listen in a non-debug build. This is a development-only tool.");
+    return false;
+#elif !defined(__EMSCRIPTEN__)
     if (_running || _thread.joinable())
     {
         AXLOGW("AgentBridge: already listening (or stop() hasn't finished). Call stop() first");
@@ -286,17 +295,21 @@ void AgentBridge::stop()
 
 void AgentBridge::setBindAddress(std::string_view address)
 {
-    _bindAddress = address;
-
-    if (!isLoopbackAddress(_bindAddress))
+    // REFUSED, not warned about. This bridge grants unauthenticated inspection and mutation of the
+    // running scene to whoever connects; a warning in a log nobody reads is not a control. The
+    // previous version logged and bound anyway, so a single mistaken call - or a copied line in a
+    // template - put that surface on every interface.
+    if (!isLoopbackAddress(address))
     {
-        AXLOGW(
-            "AgentBridge: bind address '{}' is NOT loopback. This debug bridge grants full "
-            "inspection and mutation of the running scene to whatever connects to it - it will "
-            "now be reachable from the network. This must never happen in a build reachable by "
-            "an untrusted network.",
-            _bindAddress);
+        AXLOGE(
+            "AgentBridge: refusing bind address '{}' - it is not loopback. This debug bridge is "
+            "unauthenticated and grants full inspection and mutation of the running scene, so it "
+            "is never exposed off the machine. Keeping '{}'.",
+            address, _bindAddress);
+        return;
     }
+
+    _bindAddress = address;
 }
 
 bool AgentBridge::extractLines(std::string& buffer, size_t maxLineBytes, std::vector<std::string>& outLines)
@@ -465,9 +478,10 @@ void AgentBridge::acceptClient()
         closeClient();
     }
 
-    _clientfd     = fd;
+    _clientfd         = fd;
     _recvBuffer.clear();
-    _lastActivity = std::chrono::steady_clock::now();
+    _firstLineChecked = false;
+    _lastActivity     = std::chrono::steady_clock::now();
     // READ ONLY - see loop()'s comment: requesting socket_event::error would put POLLERR into the
     // pollfd events field, which WSAPoll rejects, breaking every poll. Error and hangup arrive in
     // revents regardless, and loop() checks for them there.
@@ -607,6 +621,15 @@ void AgentBridge::probeClientLiveness()
     _watcher.mod_event(_clientfd, yasio::socket_event::read, 0);
 }
 
+/// Whether a line could be a framed request at all: a JSON object. Deliberately shape-only - the
+/// handler still does the real parsing and still answers parse_error for a malformed object. This
+/// exists to tell "a client that speaks this protocol" apart from "a peer that speaks HTTP".
+static bool looksLikeRequestLine(std::string_view line)
+{
+    const auto first = line.find_first_not_of(" \t\r\n");
+    return first != std::string_view::npos && line[first] == '{';
+}
+
 bool AgentBridge::processBufferedLines()
 {
     std::vector<std::string> lines;
@@ -631,6 +654,30 @@ bool AgentBridge::processBufferedLines()
         // correct: nothing is listening for a coherent response mid-shutdown anyway.
         if (_endThread)
             return false;
+
+        // CROSS-PROTOCOL DEFENCE. A malformed line is normally answered and the connection kept
+        // open, which is right for a JSON client that sent one bad request. But it also means a
+        // peer that speaks a DIFFERENT protocol gets its payload executed: a browser can POST to
+        // http://127.0.0.1:6010 with a CORS-safelisted content type (no preflight, so the request
+        // really is sent), and while the request and header lines merely produce parse_error
+        // responses, THE BODY IS A LINE TOO - and if it is a JSON request, it runs. Any web page a
+        // developer visits while running a debug build could therefore drive node.delete,
+        // scene.load or input.tap blind, and with DNS rebinding read the answers.
+        //
+        // The first line of a real client is always a framed request; the first line of an HTTP,
+        // TLS or WebSocket handshake never is. Refusing the connection outright on that basis
+        // costs a well-behaved client nothing and removes the entire class.
+        if (!_firstLineChecked)
+        {
+            _firstLineChecked = true;
+            if (!looksLikeRequestLine(line))
+            {
+                AXLOGW("AgentBridge: rejecting a connection whose first line is not a JSON request");
+                sendResponseLine(
+                    buildBridgeError("invalid_request", "the first line of a connection must be a JSON request"));
+                return false;
+            }
+        }
 
         if (!dispatchLine(line))
             return false;

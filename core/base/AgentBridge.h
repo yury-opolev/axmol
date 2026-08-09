@@ -173,6 +173,11 @@ private:
     // full line out of it. Cleared whenever a new client is accepted.
     std::string _recvBuffer;
 
+    // Whether the first line of the CURRENT connection has been vetted as a framed request. A
+    // peer speaking another protocol (an HTTP request from a web page, for instance) never gets
+    // past it - see processBufferedLines() for why a malformed line is otherwise tolerated.
+    bool _firstLineChecked = false;
+
     // Set whenever _clientfd changes or genuinely receives bytes; read by probeClientLiveness()
     // so a connection that was just heard from isn't re-probed on the very next idle tick.
     std::chrono::steady_clock::time_point _lastActivity;
