@@ -110,6 +110,23 @@ public:
     /** get mesh at index 0 which is the default mesh */
     Mesh* getMesh() const;
 
+    /** Applies the material described by a .material file to this renderer AND every MeshRenderer
+        beneath it, and records the path so getMaterialFile() can answer.
+
+        Recursive because a model with several named objects is loaded as a tree whose root owns no
+        meshes: applied only to the node in hand, a material would land on nothing at all and the
+        call would appear to succeed.
+
+        A .material file carries techniques, passes, vertex and fragment shaders, samplers and
+        render state, so this is the entry point for giving a model an authored look - including a
+        custom shader - without recompiling anything.
+
+        Returns false, changing nothing, if the file cannot be loaded. */
+    bool setMaterialFile(std::string_view path);
+
+    /** The .material file last applied through setMaterialFile, or "" if none was. */
+    std::string_view getMaterialFile() const { return _materialFile; }
+
     /** The model file this renderer was built from, or "" if it was created empty.
 
         Recorded because the engine otherwise discards it, and geometry is fixed at construction:
@@ -317,6 +334,10 @@ protected:
     /// The path passed to initWithFile, kept so getModelPath() can answer. Empty for a renderer
     /// built without a file.
     std::string _modelPath;
+
+    /// The .material file last applied through setMaterialFile, kept for the same reason: the
+    /// engine otherwise discards it, and nothing downstream can then report or reproduce the look.
+    std::string _materialFile;
 
     Skeleton3D* _skeleton;
 

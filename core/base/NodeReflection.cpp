@@ -44,6 +44,7 @@
 #    include "3d/Ray.h"
 #endif
 #include "base/Protocols.h"
+#include "base/ResourcePath.h"  // the one path-escape rule, shared with NodeFactory
 #include "platform/FileUtils.h"
 #include "fmt/format.h"
 
@@ -483,6 +484,66 @@ public:
 
 #if defined(AX_ENABLE_3D)
 
+/// The built-in material families, by the names the property surface uses.
+///
+/// Spelled out rather than derived from the enum: these names are part of the wire contract, so
+/// renaming an enumerator must not silently change what callers have to send.
+constexpr std::pair<std::string_view, MeshMaterial::MaterialType> kMaterialTypes[] = {
+    {"unlit", MeshMaterial::MaterialType::UNLIT},
+    {"unlitNoTex", MeshMaterial::MaterialType::UNLIT_NOTEX},
+    {"diffuse", MeshMaterial::MaterialType::DIFFUSE},
+    {"diffuseNoTex", MeshMaterial::MaterialType::DIFFUSE_NOTEX},
+    {"bumpedDiffuse", MeshMaterial::MaterialType::BUMPED_DIFFUSE},
+};
+
+bool parseMaterialType(std::string_view name, MeshMaterial::MaterialType& out)
+{
+    for (const auto& [text, type] : kMaterialTypes)
+    {
+        if (text == name)
+        {
+            out = type;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The name of the material family `mesh` is currently drawn with, or "" when it has no meshes or
+/// its material came from a file rather than the built-in set.
+std::string_view materialTypeName(MeshRenderer* mesh)
+{
+    if (mesh->getMeshCount() == 0)
+        return {};
+    auto* material = dynamic_cast<MeshMaterial*>(mesh->getMaterial(0));
+    if (!material)
+        return {};
+    for (const auto& [text, type] : kMaterialTypes)
+    {
+        if (type == material->getMaterialType())
+            return text;
+    }
+    return {};
+}
+
+/// Runs `apply` on `node` and every MeshRenderer beneath it that actually draws.
+///
+/// The recursion is the point. A model with several named objects is loaded as a tree whose root
+/// owns no meshes, so anything applied only to the node in hand lands on nothing and reports
+/// success - the same shape of failure that made colour look broken for an afternoon.
+template <typename Apply>
+void applyToMeshRenderers(Node* node, Apply&& apply)
+{
+    if (auto* renderer = dynamic_cast<MeshRenderer*>(node); renderer && renderer->getMeshCount() > 0)
+    {
+        apply(renderer);
+    }
+    for (auto&& child : node->getChildren())
+    {
+        applyToMeshRenderers(child, apply);
+    }
+}
+
 /// Mesh-specific properties. The model itself is absent on purpose: a MeshRenderer's geometry is
 /// fixed at construction, so it is a NodeFactory creation parameter rather than a property, for
 /// the same reason a Sprite's texture is. texturePath is exposed read-only so the serializer can
@@ -502,7 +563,17 @@ public:
             // a declared parameter no provider can read is silently dropped, producing a file that
             // saves without complaint and cannot be reloaded.
             {"modelPath", PropertyType::String, false},
-            {"texturePath", PropertyType::String, false},
+            // Writable, unlike modelPath: geometry is fixed at construction but a texture is not,
+            // and assigning one is the cheapest way to change how a model looks.
+            {"texturePath", PropertyType::String, true},
+            // The built-in material family: unlit, unlitNoTex, diffuse, diffuseNoTex,
+            // bumpedDiffuse. Switching between lit and unlit, or textured and not, is the coarse
+            // dial that decides whether a model responds to lights at all.
+            {"materialType", PropertyType::String, true},
+            // A .material file - techniques, passes, vertex and fragment shaders, samplers, render
+            // state. This is the shader-authoring route: an authored look can be applied to a live
+            // model without recompiling the game.
+            {"materialFile", PropertyType::String, true},
             {"lightMask", PropertyType::Int, true},
             // How many meshes this renderer draws ITSELF. Read-only, and worth its place: a model
             // with several named objects is loaded as a tree of child MeshRenderers, so the root
@@ -561,6 +632,16 @@ public:
             out           = texture ? std::string(texture->getPath()) : std::string();
             return true;
         }
+        if (name == "materialFile")
+        {
+            out = std::string(mesh->getMaterialFile());
+            return true;
+        }
+        if (name == "materialType")
+        {
+            out = std::string(materialTypeName(mesh));
+            return true;
+        }
         if (name == "lightMask")
         {
             out = static_cast<int>(mesh->getLightMask());
@@ -583,11 +664,59 @@ public:
     bool set(Node* node, std::string_view name, const PropertyValue& value) const override
     {
         auto* mesh = dynamic_cast<MeshRenderer*>(node);
-        if (!mesh || name != "lightMask" || !std::holds_alternative<int>(value))
+        if (!mesh)
             return false;
 
-        mesh->setLightMask(static_cast<unsigned int>(std::get<int>(value)));
-        return true;
+        if (name == "lightMask")
+        {
+            if (!std::holds_alternative<int>(value))
+                return false;
+            mesh->setLightMask(static_cast<unsigned int>(std::get<int>(value)));
+            return true;
+        }
+        if (name == "texturePath")
+        {
+            if (!std::holds_alternative<std::string>(value))
+                return false;
+            const auto& path = std::get<std::string>(value);
+            // Same allowlist that guards every other asset path. A scene file is untrusted input
+            // in every build, and a texture path out of one must not escape the sandbox.
+            if (path.empty() || pathEscapesWritableSandbox(path))
+                return false;
+            // Applied to descendants too: the root of a multi-object model owns no meshes, so
+            // setting a texture only on the node in hand would land on nothing while appearing to
+            // succeed.
+            applyToMeshRenderers(node, [&path](MeshRenderer* renderer) { renderer->setTexture(path); });
+            return true;
+        }
+        if (name == "materialType")
+        {
+            if (!std::holds_alternative<std::string>(value))
+                return false;
+            MeshMaterial::MaterialType type;
+            if (!parseMaterialType(std::get<std::string>(value), type))
+                return false;
+            applyToMeshRenderers(node, [type](MeshRenderer* renderer) {
+                // skinned=false: these are static models. A skinned variant would need the mesh to
+                // actually carry a skeleton, and asking for one it does not have yields a material
+                // whose vertex shader reads bone matrices that are never supplied.
+                if (auto* material = MeshMaterial::createBuiltInMaterial(type, false))
+                    renderer->setMaterial(material);
+            });
+            return true;
+        }
+        if (name == "materialFile")
+        {
+            if (!std::holds_alternative<std::string>(value))
+                return false;
+            const auto& path = std::get<std::string>(value);
+            if (path.empty() || pathEscapesWritableSandbox(path))
+                return false;
+            // setMaterialFile already walks the subtree and refuses as a whole if the file will
+            // not load, so a failed apply leaves every renderer with the look it had.
+            return mesh->setMaterialFile(path);
+        }
+        return false;
     }
 };
 

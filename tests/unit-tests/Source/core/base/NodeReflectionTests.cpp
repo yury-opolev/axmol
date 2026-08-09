@@ -1012,3 +1012,76 @@ TEST_SUITE("core/base/NodeReflection-emptymesh")
     }
 }
 #endif  // AX_ENABLE_3D
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-material")
+{
+    TEST_CASE("materialType round-trips through the property surface")
+    {
+        // The coarse dial that decides whether a model responds to lights at all. Worth a live
+        // round trip rather than a name lookup, because the set path clones a built-in material
+        // and the get path reads the type back off whatever is actually attached - if either half
+        // is wired to the wrong object the names still match and only this notices.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        // An empty renderer draws nothing, so there is no material to report and none to set.
+        // Saying so plainly beats inventing a default that does not correspond to anything.
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(mesh, "materialType", value));
+        CHECK(std::get<std::string>(value).empty());
+
+        mesh->release();
+    }
+
+    TEST_CASE("an unknown materialType is refused rather than silently ignored")
+    {
+        // The names are a wire contract. A typo must fail loudly at the call, not leave the model
+        // looking unchanged and the caller believing it applied.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+
+        CHECK_FALSE(NodeReflection::getInstance()->setProperty(mesh, "materialType", std::string("glossy")));
+
+        mesh->release();
+    }
+
+    TEST_CASE("asset paths on material properties cannot escape the sandbox")
+    {
+        // texturePath and materialFile name files, and a scene file is untrusted input in every
+        // build - these are ungated and reachable from a release loader. They must go through the
+        // same allowlist as every other asset path, so a traversal is refused rather than opened.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        for (const auto* name : {"texturePath", "materialFile"})
+        {
+            CAPTURE(name);
+            CHECK_FALSE(reflection->setProperty(mesh, name, std::string("../../../etc/passwd")));
+            CHECK_FALSE(reflection->setProperty(mesh, name, std::string("")));
+            // Wrong variant, same contract as everywhere else.
+            CHECK_FALSE(reflection->setProperty(mesh, name, 7));
+        }
+
+        mesh->release();
+    }
+
+    TEST_CASE("materialFile reports what was applied, and nothing before that")
+    {
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+
+        PropertyValue value;
+        REQUIRE(NodeReflection::getInstance()->getProperty(mesh, "materialFile", value));
+        CHECK(std::get<std::string>(value).empty());
+
+        mesh->release();
+    }
+}
+#endif  // AX_ENABLE_3D
