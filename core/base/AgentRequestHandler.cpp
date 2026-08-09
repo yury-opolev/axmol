@@ -33,6 +33,11 @@
 #include <variant>
 
 #include "2d/Node.h"
+#if defined(AX_ENABLE_3D)
+// scene.pick needs the scene's own camera to build its ray, and Scene to reach it.
+#    include "2d/Camera.h"
+#    include "2d/Scene.h"
+#endif
 #include "base/NodeFactory.h"
 #include "base/NodeReflection.h"
 #include "base/SceneSerializer.h"
@@ -443,6 +448,64 @@ bool handleInputTap(SceneAccess* access,
     result.SetObject();
     return true;
 }
+
+#if defined(AX_ENABLE_3D)
+bool handleScenePick(SceneAccess* access,
+                     const rapidjson::Value& params,
+                     rapidjson::Document& doc,
+                     rapidjson::Value& result,
+                     std::string& code,
+                     std::string& message)
+{
+    float x, y;
+    if (!getRequiredNumber(params, "x", x) || !getRequiredNumber(params, "y", y))
+    {
+        code    = "invalid_params";
+        message = "\"x\" and \"y\" are required numbers";
+        return false;
+    }
+
+    auto* root = access->getRunningScene();
+    if (!root)
+    {
+        code    = "no_scene";
+        message = "no running scene";
+        return false;
+    }
+
+    // The scene's own default camera, which is the one that drew the frame the caller is looking
+    // at. Picking through any other camera would answer a question nobody asked.
+    auto* scene  = dynamic_cast<Scene*>(root);
+    auto* camera = scene ? scene->getDefaultCamera() : nullptr;
+    if (!camera)
+    {
+        code    = "no_camera";
+        message = "the running scene has no default camera";
+        return false;
+    }
+
+    PickHit hit;
+    const auto viewSize = access->getFrameSize();
+    if (!NodeReflection::getInstance()->pick(root, camera, Vec2(x, y), viewSize, hit))
+    {
+        // A miss is an ordinary answer, not a failure: tapping the background is a normal thing to
+        // do, and making it an error would force every caller to treat "nothing there" as broken.
+        auto& allocator = doc.GetAllocator();
+        result.SetObject();
+        result.AddMember("hit", false, allocator);
+        return true;
+    }
+
+    auto& allocator = doc.GetAllocator();
+    result.SetObject();
+    result.AddMember("hit", true, allocator);
+    result.AddMember("path", jsonString(hit.path, allocator), allocator);
+    result.AddMember("typeName", jsonString(hit.typeName, allocator), allocator);
+    result.AddMember("name", jsonString(hit.name, allocator), allocator);
+    result.AddMember("distance", hit.distance, allocator);
+    return true;
+}
+#endif  // AX_ENABLE_3D
 
 bool handleInputSwipe(SceneAccess* access,
                        const rapidjson::Value& params,
@@ -1051,6 +1114,10 @@ bool dispatch(std::string_view method,
         return handleSceneSave(access, params, doc, result, code, message);
     if (method == "scene.load")
         return handleSceneLoad(access, params, doc, result, code, message);
+#if defined(AX_ENABLE_3D)
+    if (method == "scene.pick")
+        return handleScenePick(access, params, doc, result, code, message);
+#endif
     if (method == "input.tap")
         return handleInputTap(access, params, doc, result, code, message);
     if (method == "input.swipe")
