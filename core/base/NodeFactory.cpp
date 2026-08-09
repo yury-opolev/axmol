@@ -31,6 +31,15 @@
 #include "2d/Layer.h"  // LayerColor lives here
 #include "2d/Node.h"
 #include "2d/Sprite.h"
+#if defined(AX_ENABLE_3D)
+// core/3d is compiled only when AX_ENABLE_3D is on (core/CMakeLists.txt:190), while this file is
+// built unconditionally - so every reference to a 3D type stays behind this guard. Camera and
+// Light happen to live under core/2d, but they are 3D concepts and are gated with the rest.
+#    include "2d/Camera.h"
+#    include "2d/Light.h"
+#    include "3d/MeshRenderer.h"
+#    include "base/Director.h"
+#endif
 #include "base/ResourcePath.h"  // pathEscapesWritableSandbox - the one path-escape rule
 
 namespace ax
@@ -76,6 +85,25 @@ bool optionalFloat(const PropertyBag& params, std::string_view name, float& out,
     }
     return true;
 }
+
+#if defined(AX_ENABLE_3D)
+/// Reads an optional Vec3. Unlike optionalFloat there is no int-for-float leniency to offer: a
+/// Vec3 arrives already parsed by PropertyJson, so the only thing that can be wrong here is the
+/// caller having sent a different kind of value entirely.
+bool optionalVec3(const PropertyBag& params, std::string_view name, Vec3& out, std::string& outError)
+{
+    const auto* value = findParam(params, name);
+    if (!value)
+        return true;
+    if (!std::holds_alternative<Vec3>(*value))
+    {
+        outError = std::string("\"").append(name).append("\" must be a 3-component vector");
+        return false;
+    }
+    out = std::get<Vec3>(*value);
+    return true;
+}
+#endif
 
 bool requiredString(const PropertyBag& params, std::string_view name, std::string& out, std::string& outError)
 {
@@ -225,6 +253,113 @@ NodeFactory::NodeFactory()
         // construction like any other - nothing needs to be known up front.
         return LayerColor::create();
     });
+
+#if defined(AX_ENABLE_3D)
+    // modelPath is required and texturePath is not, for the same reason ax::Sprite requires its
+    // texture: there is no such thing as a mesh with no geometry, whereas a model that carries its
+    // own material needs no texture override.
+    registerType("ax::MeshRenderer", {"modelPath", "texturePath"},
+                 [](const PropertyBag& params, std::string& outError) -> Node* {
+                     std::string modelPath;
+                     std::string texturePath;
+                     if (!requiredString(params, "modelPath", modelPath, outError))
+                         return nullptr;
+                     if (!isResourceRelativePath(modelPath, outError))
+                         return nullptr;
+                     if (!optionalString(params, "texturePath", texturePath, outError))
+                         return nullptr;
+                     if (!texturePath.empty() && !isResourceRelativePath(texturePath, outError))
+                         return nullptr;
+
+                     auto* mesh = texturePath.empty() ? MeshRenderer::create(modelPath)
+                                                      : MeshRenderer::create(modelPath, texturePath);
+                     if (!mesh)
+                     {
+                         // The engine loads .obj, .c3b and .c3t (MeshRenderer.cpp:244-250) and
+                         // returns null for anything else, as well as for a file that is not on
+                         // the resource search path. Name the file: the caller cannot tell those
+                         // two cases apart from a bare failure.
+                         outError = "could not create a mesh from \"" + modelPath +
+                                    "\" (is it on the resource search path, and is it .obj, .c3b or .c3t?)";
+                         return nullptr;
+                     }
+                     return mesh;
+                 });
+
+    // fieldOfView is a creation parameter, not a property, because Camera has no setFieldOfView -
+    // createPerspective fixes it. Same reasoning as ax::Label's fontName. nearPlane and farPlane
+    // ARE settable afterwards and are declared here only so a saved camera rebuilds with the
+    // frustum it had rather than briefly springing back to the defaults on load.
+    registerType("ax::Camera", {"fieldOfView", "nearPlane", "farPlane"},
+                 [](const PropertyBag& params, std::string& outError) -> Node* {
+                     float fieldOfView = 60.0f;
+                     float nearPlane   = 1.0f;
+                     float farPlane    = 1000.0f;
+                     if (!optionalFloat(params, "fieldOfView", fieldOfView, outError) ||
+                         !optionalFloat(params, "nearPlane", nearPlane, outError) ||
+                         !optionalFloat(params, "farPlane", farPlane, outError))
+                         return nullptr;
+
+                     if (fieldOfView <= 0.0f || fieldOfView >= 180.0f)
+                     {
+                         outError = "\"fieldOfView\" must be greater than zero and less than 180";
+                         return nullptr;
+                     }
+                     if (nearPlane <= 0.0f || farPlane <= nearPlane)
+                     {
+                         // A near plane at zero degenerates the projection matrix and a far plane
+                         // behind the near one renders nothing at all - both produce a black frame
+                         // that looks like a scene problem rather than a bad parameter.
+                         outError = "\"nearPlane\" must be greater than zero and less than \"farPlane\"";
+                         return nullptr;
+                     }
+
+                     // Aspect ratio comes from the window rather than from the caller: it is a
+                     // property of the surface being rendered to, not of the camera being asked
+                     // for, and getting it wrong yields a subtly stretched frame that is hard to
+                     // attribute to a parameter nobody thought about.
+                     const auto size = Director::getInstance()->getWinSize();
+                     const float aspect = size.height > 0.0f ? size.width / size.height : 1.0f;
+
+                     auto* camera = Camera::createPerspective(fieldOfView, aspect, nearPlane, farPlane);
+                     if (!camera)
+                     {
+                         outError = "could not create a camera";
+                         return nullptr;
+                     }
+                     return camera;
+                 });
+
+    // Light colour is an ordinary writable property (BaseLight derives from Node), so none of
+    // these take one at construction - they are built white and coloured afterwards like any
+    // other node.
+    registerType("ax::DirectionLight", {"direction"},
+                 [](const PropertyBag& params, std::string& outError) -> Node* {
+                     Vec3 direction(0.0f, 0.0f, -1.0f);
+                     if (!optionalVec3(params, "direction", direction, outError))
+                         return nullptr;
+                     return DirectionLight::create(direction, Color3B::WHITE);
+                 });
+
+    registerType("ax::PointLight", {"range"}, [](const PropertyBag& params, std::string& outError) -> Node* {
+        float range = 1000.0f;
+        if (!optionalFloat(params, "range", range, outError))
+            return nullptr;
+        if (range <= 0.0f)
+        {
+            outError = "\"range\" must be greater than zero";
+            return nullptr;
+        }
+        // Position is an ordinary property; PointLight::create takes one only because its
+        // constructor does, so the origin here is immediately overwritten by whatever position
+        // the caller sets afterwards.
+        return PointLight::create(Vec3::ZERO, Color3B::WHITE, range);
+    });
+
+    registerType("ax::AmbientLight", {}, [](const PropertyBag&, std::string&) -> Node* {
+        return AmbientLight::create(Color3B::WHITE);
+    });
+#endif  // AX_ENABLE_3D
 }
 
 bool NodeFactory::registerType(std::string_view typeName, std::vector<std::string> creationParams, Creator creator)

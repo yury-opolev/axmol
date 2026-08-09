@@ -296,6 +296,9 @@ bool MeshRenderer::init()
 
 bool MeshRenderer::initWithFile(std::string_view path)
 {
+    // Recorded before any early return: loadFromCache() below succeeds without going near the
+    // rest of this function, and a cached load is still a load from this path.
+    _modelPath = path;
     _aabbDirty = true;
     _meshes.clear();
     _meshVertexDatas.clear();

@@ -26,8 +26,14 @@
 
 #include "base/NodeReflection.h"
 #include "2d/Node.h"
+#include "base/NodeFactory.h"
+#if defined(AX_ENABLE_3D)
+#    include "2d/Camera.h"
+#    include "3d/MeshRenderer.h"
+#endif
 #include "fmt/format.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -538,3 +544,193 @@ TEST_SUITE("core/base/NodeReflection")
         CHECK_EQ(Vec2(5.0f, 6.0f), std::get<Vec2>(value));
     }
 }
+
+TEST_SUITE("core/base/NodeReflection-3d")
+{
+    TEST_CASE("the 3D transform is reflected on every node, not just 3D ones")
+    {
+        // position3D/rotation3D/scaleZ live on the base Node provider deliberately: Node carries
+        // this state whether or not AX_ENABLE_3D is on, and a 2D Sprite laid out on a board at a
+        // depth is an ordinary thing to want. Gating them behind the 3D module would make the
+        // property surface depend on a build option that has nothing to do with them.
+        auto* node = Node::create();
+        node->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        REQUIRE(reflection->setProperty(node, "position3D", Vec3(1.0f, 2.0f, 3.0f)));
+        REQUIRE(reflection->setProperty(node, "rotation3D", Vec3(10.0f, 20.0f, 30.0f)));
+        REQUIRE(reflection->setProperty(node, "scaleZ", 4.0f));
+
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(node, "position3D", value));
+        CHECK_EQ(Vec3(1.0f, 2.0f, 3.0f), std::get<Vec3>(value));
+        REQUIRE(reflection->getProperty(node, "rotation3D", value));
+        CHECK_EQ(Vec3(10.0f, 20.0f, 30.0f), std::get<Vec3>(value));
+        REQUIRE(reflection->getProperty(node, "scaleZ", value));
+        CHECK(std::get<float>(value) == doctest::Approx(4.0f));
+
+        node->release();
+    }
+
+    TEST_CASE("writing position3D agrees with the 2D position on x and y")
+    {
+        // The two properties are views of one piece of state. If they ever disagree, an agent
+        // reading the tree (which reports the 2D position) would be looking at a different node
+        // from the one it just moved.
+        auto* node = Node::create();
+        node->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        REQUIRE(reflection->setProperty(node, "position3D", Vec3(7.0f, 8.0f, 9.0f)));
+
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(node, "position", value));
+        CHECK_EQ(Vec2(7.0f, 8.0f), std::get<Vec2>(value));
+
+        node->release();
+    }
+
+    TEST_CASE("a 3D property rejects the wrong variant alternative without mutating the node")
+    {
+        // The contract every provider owes setProperty: reject cleanly, leave the node alone.
+        // Worth pinning here because a Vec2 passed where a Vec3 belongs is the single most likely
+        // mistake a caller writing JSON by hand will make.
+        auto* node = Node::create();
+        node->retain();
+        node->setPosition3D(Vec3(1.0f, 2.0f, 3.0f));
+        auto* reflection = NodeReflection::getInstance();
+
+        // GUARD: setProperty also returns false for a name nobody recognises, so without this the
+        // two CHECK_FALSEs below would pass just as happily against a build where these properties
+        // do not exist at all - proving nothing about the type checking they are meant to pin.
+        REQUIRE(reflection->setProperty(node, "position3D", Vec3(1.0f, 2.0f, 3.0f)));
+
+        CHECK_FALSE(reflection->setProperty(node, "position3D", Vec2(50.0f, 60.0f)));
+        CHECK_FALSE(reflection->setProperty(node, "scaleZ", 5));
+
+        CHECK_EQ(Vec3(1.0f, 2.0f, 3.0f), node->getPosition3D());
+        CHECK(node->getScaleZ() == doctest::Approx(1.0f));
+
+        node->release();
+    }
+
+    TEST_CASE("describe reports depth, so a 3D tree does not read as flat")
+    {
+        // Without this, describeTree returns a Vec2 position for every node and a board whose
+        // pieces differ only in Z comes back looking like a pile at one point. Being silently
+        // wrong is worse than being incomplete - the agent has no way to notice.
+        auto* node = Node::create();
+        node->retain();
+        node->setPosition3D(Vec3(1.0f, 2.0f, 30.0f));
+        node->setRotation3D(Vec3(11.0f, 22.0f, 33.0f));
+        node->setScaleZ(2.5f);
+
+        const auto info = NodeReflection::getInstance()->describe(node, "/");
+
+        CHECK(info.positionZ == doctest::Approx(30.0f));
+        CHECK(info.scaleZ == doctest::Approx(2.5f));
+        CHECK_EQ(Vec3(11.0f, 22.0f, 33.0f), info.rotation3D);
+
+        node->release();
+    }
+
+    TEST_CASE("the 3D transform properties are listed, not merely gettable")
+    {
+        // listProperties is what axmol_node_properties reports, and it is how an agent discovers
+        // what it may write. A property that works but is not advertised is one nobody uses.
+        auto* node = Node::create();
+        node->retain();
+
+        const auto properties = NodeReflection::getInstance()->listProperties(node);
+        const auto has        = [&](std::string_view name, PropertyType type) {
+            return std::any_of(properties.begin(), properties.end(), [&](const PropertyInfo& p) {
+                return p.name == name && p.type == type && p.writable;
+            });
+        };
+
+        CHECK(has("position3D", PropertyType::Vec3));
+        CHECK(has("rotation3D", PropertyType::Vec3));
+        CHECK(has("scaleZ", PropertyType::Float));
+
+        node->release();
+    }
+}
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-3d-roundtrip")
+{
+    TEST_CASE("every creation parameter a 3D type declares is readable as a property")
+    {
+        // THE CONTRACT, spelled out on NodeFactory::registerType: creation params are captured at
+        // save time by reading them back through NodeReflection (SceneSerializer.cpp:130-135), and
+        // a name no provider exposes is SILENTLY SKIPPED. So a type that declares a param nobody
+        // can read produces a file that reports success and cannot be reloaded - the exact defect
+        // the depth-cap fix dealt with in the last review, arriving by a different route.
+        //
+        // MeshRenderer::create() with no arguments builds an empty renderer without touching the
+        // filesystem, which is what makes this testable headlessly at all.
+        auto* factory    = NodeFactory::getInstance();
+        auto* reflection = NodeReflection::getInstance();
+
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+
+        for (const auto& param : factory->creationParams("ax::MeshRenderer"))
+        {
+            CAPTURE(param);
+            PropertyValue value;
+            CHECK(reflection->getProperty(mesh, param, value));
+        }
+        mesh->release();
+
+        auto* camera = Camera::create();
+        REQUIRE(camera != nullptr);
+        camera->retain();
+
+        for (const auto& param : factory->creationParams("ax::Camera"))
+        {
+            CAPTURE(param);
+            PropertyValue value;
+            CHECK(reflection->getProperty(camera, param, value));
+        }
+        camera->release();
+    }
+
+    TEST_CASE("a light round-trips its creation parameters")
+    {
+        // Lights are the one 3D family fully constructible headlessly, so this closes the loop the
+        // test above only checks halfway: declared, readable, AND the value that comes back is the
+        // one that was asked for.
+        auto* factory    = NodeFactory::getInstance();
+        auto* reflection = NodeReflection::getInstance();
+
+        std::string error;
+        auto* light = factory->create("ax::PointLight", {{"range", 250.0f}}, error);
+        REQUIRE(light != nullptr);
+        light->retain();
+
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(light, "range", value));
+        CHECK(std::get<float>(value) == doctest::Approx(250.0f));
+
+        auto* directional = factory->create("ax::DirectionLight", {{"direction", Vec3(0.0f, -1.0f, 0.0f)}}, error);
+        REQUIRE(directional != nullptr);
+        directional->retain();
+
+        // Compared with tolerance, not exactly, and that is a fact about the engine rather than a
+        // slack assertion: DirectionLight stores a direction as a ROTATION (setRotationFromDirection)
+        // and recovers it from the transform matrix, so what comes back is the normalised direction
+        // reconstructed through trigonometry. A caller that writes (0, -2, 0) reads back (0, -1, 0);
+        // the bearing round-trips, the magnitude does not.
+        REQUIRE(reflection->getProperty(directional, "direction", value));
+        const auto direction = std::get<Vec3>(value);
+        CHECK(direction.x == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(direction.y == doctest::Approx(-1.0f).epsilon(0.001));
+        CHECK(direction.z == doctest::Approx(0.0f).epsilon(0.001));
+
+        light->release();
+        directional->release();
+    }
+}
+#endif  // AX_ENABLE_3D
