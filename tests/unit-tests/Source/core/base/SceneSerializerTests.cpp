@@ -26,6 +26,9 @@
 
 #include "2d/Camera.h"
 #include "2d/Node.h"
+#if defined(AX_ENABLE_3D)
+#    include "3d/MeshRenderer.h"
+#endif
 #include "2d/Scene.h"
 #include "base/NodeFactory.h"
 #include "base/NodeReflection.h"
@@ -577,3 +580,29 @@ TEST_CASE("a shallow tree is not truncated and reports nothing")
     CHECK(warnings.empty());
     CHECK(json.find("truncated") == std::string::npos);
 }
+
+#if defined(AX_ENABLE_3D)
+TEST_CASE("a_mesh_renderer_without_a_model_still_serializes_its_own_children")
+{
+    // THE OTHER HALF of the generated-children rule, and the dangerous half.
+    //
+    // Children of a MeshRenderer that LOADED A MODEL are skipped, because they follow from the
+    // model path and are recreated by loading it - writing them produced children with an empty
+    // modelPath that made the file unloadable. But a MeshRenderer built in code and given children
+    // deliberately is ordinary authored content, and dropping those would lose real work while
+    // reporting a successful save. The rule keys on a non-empty model path for exactly that
+    // reason, and this pins it: broaden the rule to "is a MeshRenderer with children" and this
+    // test goes red.
+    auto* root = MeshRenderer::create();
+    REQUIRE(root != nullptr);
+    REQUIRE(root->getModelPath().empty());
+
+    auto* child = Node::create();
+    child->setName("authoredChild");
+    root->addChild(child);
+
+    const auto json = serializeOrFail(root);
+
+    CHECK(json.find("authoredChild") != std::string::npos);
+}
+#endif  // AX_ENABLE_3D
