@@ -734,3 +734,105 @@ TEST_SUITE("core/base/NodeReflection-3d-roundtrip")
     }
 }
 #endif  // AX_ENABLE_3D
+
+TEST_SUITE("core/base/NodeReflection-cascade")
+{
+    TEST_CASE("cascadeColor and cascadeOpacity are reflected, readable and writable")
+    {
+        // THE GAP THIS CLOSES. A model loaded from a file with several named objects becomes a
+        // TREE of nodes, not one node, so setting "color" on its root reaches nothing unless
+        // colour cascades - and cascading is OFF by default. Without these two properties an agent
+        // can see a colour it set, see it have no effect, and have no way to discover why or to
+        // fix it, because the switch that governs it was not on the property surface at all.
+        auto* node = Node::create();
+        node->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(node, "cascadeColor", value));
+        CHECK_FALSE(std::get<bool>(value));
+
+        REQUIRE(reflection->setProperty(node, "cascadeColor", true));
+        REQUIRE(reflection->getProperty(node, "cascadeColor", value));
+        CHECK(std::get<bool>(value));
+        CHECK(node->isCascadeColorEnabled());
+
+        REQUIRE(reflection->setProperty(node, "cascadeOpacity", true));
+        REQUIRE(reflection->getProperty(node, "cascadeOpacity", value));
+        CHECK(std::get<bool>(value));
+        CHECK(node->isCascadeOpacityEnabled());
+
+        node->release();
+    }
+
+    TEST_CASE("cascadeColor actually carries a colour down to a child")
+    {
+        // The property is only worth exposing if flipping it changes what a child draws, so this
+        // asserts the effect rather than the flag. It is also the exact scenario that cost real
+        // time: a parent whose colour looked ignored because the drawing happened one level down.
+        auto* parent = Node::create();
+        parent->retain();
+        auto* child = Node::create();
+        parent->addChild(child);
+
+        auto* reflection = NodeReflection::getInstance();
+
+        REQUIRE(reflection->setProperty(parent, "color", Color4B(255, 0, 0, 255)));
+        CHECK_EQ(Color3B(255, 255, 255), child->getDisplayedColor());
+
+        REQUIRE(reflection->setProperty(parent, "cascadeColor", true));
+        REQUIRE(reflection->setProperty(parent, "color", Color4B(255, 0, 0, 255)));
+        CHECK_EQ(Color3B(255, 0, 0), child->getDisplayedColor());
+
+        parent->release();
+    }
+
+    TEST_CASE("a cascade property rejects the wrong variant alternative without mutating")
+    {
+        auto* node = Node::create();
+        node->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        // GUARD: an unknown name is rejected too, so without a successful write first this would
+        // pass against a build where the property does not exist at all.
+        REQUIRE(reflection->setProperty(node, "cascadeColor", true));
+
+        CHECK_FALSE(reflection->setProperty(node, "cascadeColor", 1));
+        CHECK(node->isCascadeColorEnabled());
+
+        node->release();
+    }
+}
+
+#if defined(AX_ENABLE_3D)
+TEST_SUITE("core/base/NodeReflection-meshcount")
+{
+    TEST_CASE("meshCount is reported and is read-only")
+    {
+        // The number that makes "my colour is being ignored" distinguishable from "I am talking to
+        // the wrong node". A model with several named objects loads as a TREE of MeshRenderers and
+        // its root draws nothing, reporting 0 here - which is invisible from outside the process
+        // unless it is on the property surface.
+        auto* mesh = MeshRenderer::create();
+        REQUIRE(mesh != nullptr);
+        mesh->retain();
+        auto* reflection = NodeReflection::getInstance();
+
+        PropertyValue value;
+        REQUIRE(reflection->getProperty(mesh, "meshCount", value));
+        CHECK(std::get<int>(value) == 0);
+
+        // Read-only: it describes the loaded model, and pretending it can be assigned would be a
+        // write that silently does nothing.
+        CHECK_FALSE(reflection->setProperty(mesh, "meshCount", 5));
+
+        const auto properties = reflection->listProperties(mesh);
+        const auto entry      = std::find_if(properties.begin(), properties.end(),
+                                             [](const PropertyInfo& p) { return p.name == "meshCount"; });
+        REQUIRE(entry != properties.end());
+        CHECK_FALSE(entry->writable);
+
+        mesh->release();
+    }
+}
+#endif  // AX_ENABLE_3D

@@ -89,6 +89,12 @@ public:
             // would make the property surface depend on a build option unrelated to them.
             {"position3D", PropertyType::Vec3, true},     {"rotation3D", PropertyType::Vec3, true},
             {"scaleZ", PropertyType::Float, true},
+            // Exposed because a model loaded from a file is a TREE of nodes, not one node: a
+            // loader builds a child per named object, so the node a caller holds may draw nothing
+            // itself and "color" on it reaches nothing. Cascading is off by default, and without
+            // it on the property surface a caller can set a colour, watch it do nothing, and have
+            // no way to discover why - the governing switch was simply invisible.
+            {"cascadeColor", PropertyType::Bool, true},   {"cascadeOpacity", PropertyType::Bool, true},
         };
     }
 
@@ -130,6 +136,10 @@ public:
             out = Color4B(node->getColor(), node->getOpacity());
         else if (name == "opacity")
             out = static_cast<int>(node->getOpacity());
+        else if (name == "cascadeColor")
+            out = node->isCascadeColorEnabled();
+        else if (name == "cascadeOpacity")
+            out = node->isCascadeOpacityEnabled();
         else
             return false;
         return true;
@@ -242,6 +252,18 @@ public:
             if (opacity < 0 || opacity > 255)
                 return false;
             node->setOpacity(static_cast<uint8_t>(opacity));
+        }
+        else if (name == "cascadeColor")
+        {
+            if (!std::holds_alternative<bool>(value))
+                return false;
+            node->setCascadeColorEnabled(std::get<bool>(value));
+        }
+        else if (name == "cascadeOpacity")
+        {
+            if (!std::holds_alternative<bool>(value))
+                return false;
+            node->setCascadeOpacityEnabled(std::get<bool>(value));
         }
         else
         {
@@ -481,6 +503,12 @@ public:
             {"modelPath", PropertyType::String, false},
             {"texturePath", PropertyType::String, false},
             {"lightMask", PropertyType::Int, true},
+            // How many meshes this renderer draws ITSELF. Read-only, and worth its place: a model
+            // with several named objects is loaded as a tree of child MeshRenderers, so the root
+            // frequently draws nothing and reports 0 here. That number is the difference between
+            // "my colour is being ignored" and "I am talking to the wrong node", and without it
+            // the two are indistinguishable from outside the process.
+            {"meshCount", PropertyType::Int, false},
         };
     }
 
@@ -510,6 +538,11 @@ public:
         if (name == "lightMask")
         {
             out = static_cast<int>(mesh->getLightMask());
+            return true;
+        }
+        if (name == "meshCount")
+        {
+            out = static_cast<int>(mesh->getMeshCount());
             return true;
         }
         return false;
