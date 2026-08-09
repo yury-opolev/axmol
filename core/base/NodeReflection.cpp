@@ -509,6 +509,18 @@ public:
             // "my colour is being ignored" and "I am talking to the wrong node", and without it
             // the two are indistinguishable from outside the process.
             {"meshCount", PropertyType::Int, false},
+            // World-space bounds of this renderer AND ITS CHILDREN, via getAABBRecursively().
+            //
+            // Recursive on purpose. getAABB() covers only the meshes a node owns directly, so on
+            // the tree root of a multi-object model - which owns none - it returns AABB::reset()'s
+            // sentinel: min +99999, max -99999. That is not an error value anything checks, so a
+            // caller scaling itself from those bounds silently does nothing, which is exactly how
+            // an auto-fit here ended up drawing a model one pixel wide.
+            //
+            // World space, not model space: the transform is already applied, so these answer
+            // "where is this on screen and how big" - the question layout, framing and hit-testing
+            // actually ask. Model-space extents would need the scale undone by every caller.
+            {"boundsMin", PropertyType::Vec3, false},     {"boundsMax", PropertyType::Vec3, false},
         };
     }
 
@@ -543,6 +555,12 @@ public:
         if (name == "meshCount")
         {
             out = static_cast<int>(mesh->getMeshCount());
+            return true;
+        }
+        if (name == "boundsMin" || name == "boundsMax")
+        {
+            const auto bounds = mesh->getAABBRecursively();
+            out               = (name == "boundsMin") ? bounds._min : bounds._max;
             return true;
         }
         return false;
