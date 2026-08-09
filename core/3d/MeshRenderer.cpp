@@ -937,6 +937,41 @@ AABB MeshRenderer::getAABBRecursively()
     return getAABBRecursivelyImp(this);
 }
 
+namespace
+{
+/// Applies `material` to `node` and to every MeshRenderer beneath it.
+///
+/// Each renderer gets its own clone. Sharing one Material across renderers would make a later
+/// per-instance change - a colour, a uniform - silently affect every model that happened to be
+/// given the same material file.
+void applyMaterialRecursively(Node* node, MeshMaterial* material)
+{
+    if (auto* renderer = dynamic_cast<MeshRenderer*>(node); renderer && renderer->getMeshCount() > 0)
+    {
+        renderer->setMaterial(static_cast<MeshMaterial*>(material->clone()));
+    }
+    for (auto&& child : node->getChildren())
+    {
+        applyMaterialRecursively(child, material);
+    }
+}
+}  // namespace
+
+bool MeshRenderer::setMaterialFile(std::string_view path)
+{
+    auto* material = MeshMaterial::createWithFilename(path);
+    if (!material)
+    {
+        // Nothing is changed on failure: a half-applied material across a subtree would be worse
+        // than none, because part of the model would silently keep its old look.
+        return false;
+    }
+
+    applyMaterialRecursively(this, material);
+    _materialFile = path;
+    return true;
+}
+
 const AABB& MeshRenderer::getAABB() const
 {
     Mat4 nodeToWorldTransform(getNodeToWorldTransform());
