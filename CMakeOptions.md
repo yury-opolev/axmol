@@ -14,6 +14,7 @@
   - AX_ENABLE_MEDIA: whether to enable media support, default: `TRUE`
   - AX_ENABLE_AUDIO: whether to enable audio support, default: `TRUE`
   - AX_ENABLE_CONSOLE: whether to enable debug tool console support, default: `TRUE`
+  - AX_ENABLE_AGENT_BRIDGE: whether to enable the agent bridge debug tool (TCP/JSON scene inspection and mutation - development only, never enable in a shipped build), default: `TRUE`
   - AX_ENABLE_OPUS: whether to enable audio engine play .opus files support, default: `TRUE`
 - AX_USE_XXX:
   - AX_USE_LUAJIT: whether use luajit, default: `FALSE`, use plainlua
