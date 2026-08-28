@@ -63,9 +63,10 @@ AX_DLL bool isEngineManagedNode(Node* node);
         }
 
     A node may additionally carry `"unsupported": true` (no factory can rebuild this type - see
-    below) or `"truncated": true` with `"truncatedType"` (the subtree was deeper than 128 levels).
-    Both are readable by a version-1 reader that ignores unknown members, so neither bumps
-    kFormatVersion.
+    below), `"truncated": true` with `"truncatedType"` (the subtree was deeper than 128 levels), or
+    `"degraded": true` with `"degradedType"` (the type IS known, but this particular node could not
+    have been rebuilt - see UNREBUILDABLE NODES). All three are readable by a version-1 reader that
+    ignores unknown members, so none of them bumps kFormatVersion.
 
     WHY "create" AND "props" ARE SEPARATE. `create` holds what NodeFactory needs BEFORE the node
     exists; `props` holds writable reflected properties applied after. Merging them breaks in both
@@ -91,6 +92,15 @@ AX_DLL bool isEngineManagedNode(Node* node);
     scene file is data that can arrive from anywhere and both directions recurse; the marker is a
     plain node so that the resulting file still LOADS, which a truncated ax::Sprite (no `create`
     block) would not.
+
+    UNREBUILDABLE NODES. A registered type is normally proof that a node round trips - that is what
+    registering one means. It is not proof when the node was not built from the asset its factory
+    takes: a MeshRenderer whose geometry was generated in code has no modelPath to report, and the
+    factory refuses an empty one. Such a node is written as a plain ax::Node carrying
+    "degraded": true and "degradedType", keeping its properties and children, and reported through
+    serialize()'s warnings. It is a plain node for the same reason the depth marker is: a marker the
+    loader cannot build is not a degraded file, it is a broken one. This is what registerType's
+    `requiredParams` exists to make knowable without constructing anything.
 
     UNREPRESENTABLE NODES. A node whose type has no registered factory is written with
     "unsupported": true, keeping its properties and children so the file loses nothing. Loading

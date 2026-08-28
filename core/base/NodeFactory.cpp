@@ -188,9 +188,9 @@ void NodeFactory::destroyInstance()
 
 NodeFactory::NodeFactory()
 {
-    registerType("ax::Node", {}, [](const PropertyBag&, std::string&) -> Node* { return Node::create(); });
+    registerType("ax::Node", {}, {}, [](const PropertyBag&, std::string&) -> Node* { return Node::create(); });
 
-    registerType("ax::Sprite", {"texturePath"},
+    registerType("ax::Sprite", {"texturePath"}, {"texturePath"},
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      std::string texturePath;
                      if (!requiredString(params, "texturePath", texturePath, outError))
@@ -215,7 +215,7 @@ NodeFactory::NodeFactory()
     // supply: a label with no font named is a valid thing to ask for, and Axmol has a platform
     // default for exactly that. Contrast texturePath, which is required because there is no such
     // thing as a sprite with no texture.
-    registerType("ax::Label", {"fontName", "fontSize"},
+    registerType("ax::Label", {"fontName", "fontSize"}, {},
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      std::string text;
                      std::string fontName;
@@ -248,7 +248,7 @@ NodeFactory::NodeFactory()
                      return label;
                  });
 
-    registerType("ax::LayerColor", {}, [](const PropertyBag&, std::string&) -> Node* {
+    registerType("ax::LayerColor", {}, {}, [](const PropertyBag&, std::string&) -> Node* {
         // Colour and size are ordinary writable properties, so they are applied after
         // construction like any other - nothing needs to be known up front.
         return LayerColor::create();
@@ -258,7 +258,7 @@ NodeFactory::NodeFactory()
     // modelPath is required and texturePath is not, for the same reason ax::Sprite requires its
     // texture: there is no such thing as a mesh with no geometry, whereas a model that carries its
     // own material needs no texture override.
-    registerType("ax::MeshRenderer", {"modelPath", "texturePath"},
+    registerType("ax::MeshRenderer", {"modelPath", "texturePath"}, {"modelPath"},
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      std::string modelPath;
                      std::string texturePath;
@@ -290,7 +290,7 @@ NodeFactory::NodeFactory()
     // createPerspective fixes it. Same reasoning as ax::Label's fontName. nearPlane and farPlane
     // ARE settable afterwards and are declared here only so a saved camera rebuilds with the
     // frustum it had rather than briefly springing back to the defaults on load.
-    registerType("ax::Camera", {"fieldOfView", "nearPlane", "farPlane"},
+    registerType("ax::Camera", {"fieldOfView", "nearPlane", "farPlane"}, {},
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      float fieldOfView = 60.0f;
                      float nearPlane   = 1.0f;
@@ -333,7 +333,7 @@ NodeFactory::NodeFactory()
     // Light colour is an ordinary writable property (BaseLight derives from Node), so none of
     // these take one at construction - they are built white and coloured afterwards like any
     // other node.
-    registerType("ax::DirectionLight", {"direction"},
+    registerType("ax::DirectionLight", {"direction"}, {},
                  [](const PropertyBag& params, std::string& outError) -> Node* {
                      Vec3 direction(0.0f, 0.0f, -1.0f);
                      if (!optionalVec3(params, "direction", direction, outError))
@@ -341,7 +341,7 @@ NodeFactory::NodeFactory()
                      return DirectionLight::create(direction, Color3B::WHITE);
                  });
 
-    registerType("ax::PointLight", {"range"}, [](const PropertyBag& params, std::string& outError) -> Node* {
+    registerType("ax::PointLight", {"range"}, {}, [](const PropertyBag& params, std::string& outError) -> Node* {
         float range = 1000.0f;
         if (!optionalFloat(params, "range", range, outError))
             return nullptr;
@@ -356,18 +356,22 @@ NodeFactory::NodeFactory()
         return PointLight::create(Vec3::ZERO, Color3B::WHITE, range);
     });
 
-    registerType("ax::AmbientLight", {}, [](const PropertyBag&, std::string&) -> Node* {
+    registerType("ax::AmbientLight", {}, {}, [](const PropertyBag&, std::string&) -> Node* {
         return AmbientLight::create(Color3B::WHITE);
     });
 #endif  // AX_ENABLE_3D
 }
 
-bool NodeFactory::registerType(std::string_view typeName, std::vector<std::string> creationParams, Creator creator)
+bool NodeFactory::registerType(std::string_view typeName,
+                               std::vector<std::string> creationParams,
+                               std::vector<std::string> requiredParams,
+                               Creator creator)
 {
     if (typeName.empty() || !creator || find(typeName))
         return false;
 
-    _registrations.push_back({std::string(typeName), std::move(creationParams), std::move(creator)});
+    _registrations.push_back(
+        {std::string(typeName), std::move(creationParams), std::move(requiredParams), std::move(creator)});
     return true;
 }
 
@@ -396,6 +400,12 @@ std::vector<std::string> NodeFactory::creationParams(std::string_view typeName) 
 {
     const auto* registration = find(typeName);
     return registration ? registration->creationParams : std::vector<std::string>{};
+}
+
+std::vector<std::string> NodeFactory::requiredCreationParams(std::string_view typeName) const
+{
+    const auto* registration = find(typeName);
+    return registration ? registration->requiredParams : std::vector<std::string>{};
 }
 
 Node* NodeFactory::create(std::string_view typeName, const PropertyBag& params, std::string& outError) const

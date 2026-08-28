@@ -75,9 +75,25 @@ public:
         name listed here must be a property some provider exposes for that type - otherwise a
         round trip silently loses the information needed to rebuild it.
 
+        `requiredParams` is the subset of `creationParams` without which `creator` REFUSES to build -
+        the ones it puts through requiredString and friends rather than the optional variants. It has
+        to be declared here because requiredness otherwise lives only inside the creator's body, where
+        nothing but a call can discover it, and a SERIALIZER needs to know before it writes: a node
+        whose required parameter cannot be read back off it is a node the file could not rebuild, and
+        writing it as though it could produces a file that saves cleanly and never loads. That is not
+        hypothetical - see SceneSerializer's degradation path, which exists because a MeshRenderer
+        built in code has no modelPath to record.
+
+        Keep it beside the creator it describes. It duplicates what the creator's own requiredString
+        calls say, and the only defence against the two drifting apart is that they are three lines
+        from each other.
+
         Returns false, leaving the existing registration untouched, if `typeName` is already
         registered or `creator` is empty. */
-    bool registerType(std::string_view typeName, std::vector<std::string> creationParams, Creator creator);
+    bool registerType(std::string_view typeName,
+                      std::vector<std::string> creationParams,
+                      std::vector<std::string> requiredParams,
+                      Creator creator);
 
     /** Whether a creator is registered for this exact type name. */
     bool isRegistered(std::string_view typeName) const;
@@ -89,6 +105,13 @@ public:
     /** The parameter names a serializer must capture for `typeName`, or an empty vector if the
         type is unregistered or needs none. */
     std::vector<std::string> creationParams(std::string_view typeName) const;
+
+    /** The subset of creationParams() that `typeName` cannot be built without - see registerType.
+
+        A serializer asks this to find out whether what it just read off a node is enough to rebuild
+        it, WITHOUT building one: constructing a node to find out would load the very asset the
+        question is about. Empty for an unregistered type, and for the many types that need nothing. */
+    std::vector<std::string> requiredCreationParams(std::string_view typeName) const;
 
     /** Creates a node. Returns nullptr with `outError` set if the type is unknown, a required
         parameter is missing or of the wrong type, or the engine refused to build the object
@@ -106,6 +129,7 @@ private:
     {
         std::string typeName;
         std::vector<std::string> creationParams;
+        std::vector<std::string> requiredParams;
         Creator creator;
     };
 

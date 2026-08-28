@@ -25,6 +25,7 @@
 #include "base/SceneSerializer.h"
 
 #include <algorithm>
+#include <variant>
 
 #include "2d/Camera.h"
 #include "2d/Node.h"
@@ -101,6 +102,34 @@ std::string documentPath(const std::string& parentPath, size_t index)
     return parentPath + "/" + std::to_string(index);
 }
 
+/// Whether `have` - the creation parameters just read off a live node - would satisfy a factory that
+/// demands `required`. Names the first one that would not, so the warning can say which.
+///
+/// ASKED RATHER THAN TRIED. The direct way to find out is to build the node and see, but building it
+/// means loading the very asset the question is about - and the question is being asked precisely
+/// because that asset may not exist. So the test mirrors NodeFactory's requiredString instead:
+/// present, and if it is a string, not empty. An empty asset path is not a path.
+bool hasEveryRequiredParam(const std::vector<std::string>& required,
+                           const PropertyBag& have,
+                           std::string& outMissing)
+{
+    for (const auto& name : required)
+    {
+        const PropertyValue* value = findParam(have, name);
+        if (value == nullptr)
+        {
+            outMissing = name;
+            return false;
+        }
+        if (const auto* text = std::get_if<std::string>(value); text != nullptr && text->empty())
+        {
+            outMissing = name;
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Writes one node and its subtree.
 ///
 /// `depth` is bounded for the same reason the load side is: an agent can build an arbitrarily deep
@@ -143,23 +172,64 @@ rapidjson::Value serializeNode(Node* node,
     const std::string typeName = NodeReflection::getTypeName(node);
 
     rapidjson::Value obj(rapidjson::kObjectType);
-    obj.AddMember("type", jsonString(typeName, allocator), allocator);
 
-    if (!factory->isRegistered(typeName))
-    {
-        // Recorded rather than dropped: the file keeps this node's properties and children, so
-        // nothing is lost, and a reader can tell exactly what it cannot rebuild.
-        obj.AddMember("unsupported", true, allocator);
-    }
-
-    rapidjson::Value create(rapidjson::kObjectType);
+    // WHAT THE FACTORY WOULD NEED, read off the live node BEFORE anything is written - because
+    // whether it is complete decides what type this node is written as.
+    PropertyBag creation;
     for (const auto& name : factory->creationParams(typeName))
     {
         PropertyValue value;
         if (reflection->getProperty(node, name, value))
-            create.AddMember(jsonString(name, allocator), encodePropertyValue(value, allocator), allocator);
+            creation.emplace_back(name, std::move(value));
     }
-    obj.AddMember("create", create, allocator);
+
+    // A NODE OF A KNOWN TYPE THAT STILL CANNOT BE REBUILT.
+    //
+    // A registered type is normally enough to guarantee a round trip - that is what registration
+    // means. It is not enough when the node was not built from the asset its factory takes: a
+    // MeshRenderer whose geometry was generated in code has no modelPath, so reflection reports an
+    // empty string, and an empty string is exactly what the factory REFUSES ("modelPath must not be
+    // empty"). Writing it anyway produced a file that saved cleanly, reported success, and could
+    // then never be loaded by any option - allowDegraded included, since that covers an unknown
+    // TYPE and this type is perfectly well known.
+    //
+    // So it is written as the same plain marker a too-deep subtree gets, and for the identical
+    // reason given there: the marker has to be a node the loader can actually build, or degrading is
+    // just a different way of writing a broken file. The real type travels alongside it, and the
+    // props and children are kept, so nothing is lost but the geometry that was never in the file to
+    // begin with.
+    std::string unrecoverable;
+    const bool rebuildable = !factory->isRegistered(typeName) ||
+                             hasEveryRequiredParam(factory->requiredCreationParams(typeName), creation, unrecoverable);
+
+    if (!rebuildable)
+    {
+        obj.AddMember("type", jsonString("ax::Node", allocator), allocator);
+        obj.AddMember("degraded", true, allocator);
+        obj.AddMember("degradedType", jsonString(typeName, allocator), allocator);
+        obj.AddMember("create", rapidjson::Value(rapidjson::kObjectType), allocator);
+        outWarnings.push_back("wrote \"" + typeName + "\" at " + path + " as a plain ax::Node: its \"" +
+                              unrecoverable +
+                              "\" is not recoverable from the node, so a rebuilt one would have been refused");
+    }
+    else
+    {
+        obj.AddMember("type", jsonString(typeName, allocator), allocator);
+
+        if (!factory->isRegistered(typeName))
+        {
+            // Recorded rather than dropped: the file keeps this node's properties and children, so
+            // nothing is lost, and a reader can tell exactly what it cannot rebuild.
+            obj.AddMember("unsupported", true, allocator);
+        }
+
+        rapidjson::Value create(rapidjson::kObjectType);
+        for (auto& [name, value] : creation)
+        {
+            create.AddMember(jsonString(name, allocator), encodePropertyValue(value, allocator), allocator);
+        }
+        obj.AddMember("create", create, allocator);
+    }
 
     rapidjson::Value props(rapidjson::kObjectType);
     for (const auto& info : reflection->listProperties(node))

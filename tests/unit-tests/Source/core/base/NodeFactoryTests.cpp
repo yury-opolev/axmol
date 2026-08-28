@@ -123,18 +123,18 @@ TEST_CASE("registration_is_not_silently_overwritten")
     auto* factory = NodeFactory::getInstance();
     const auto creator = [](const PropertyBag&, std::string&) -> Node* { return Node::create(); };
 
-    CHECK(factory->registerType("test::Unique1", {}, creator));
+    CHECK(factory->registerType("test::Unique1", {}, {}, creator));
     // A second registration must not replace the first: two components each registering "their"
     // version of a type would otherwise silently depend on load order.
-    CHECK_FALSE(factory->registerType("test::Unique1", {}, creator));
+    CHECK_FALSE(factory->registerType("test::Unique1", {}, {}, creator));
     CHECK(factory->isRegistered("test::Unique1"));
 }
 
 TEST_CASE("registration_rejects_an_empty_name_or_creator")
 {
     auto* factory = NodeFactory::getInstance();
-    CHECK_FALSE(factory->registerType("", {}, [](const PropertyBag&, std::string&) -> Node* { return nullptr; }));
-    CHECK_FALSE(factory->registerType("test::NoCreator", {}, NodeFactory::Creator{}));
+    CHECK_FALSE(factory->registerType("", {}, {}, [](const PropertyBag&, std::string&) -> Node* { return nullptr; }));
+    CHECK_FALSE(factory->registerType("test::NoCreator", {}, {}, NodeFactory::Creator{}));
     CHECK_FALSE(factory->isRegistered("test::NoCreator"));
 }
 
@@ -142,7 +142,7 @@ TEST_CASE("a_creator_that_fails_without_a_message_still_produces_one")
 {
     // Otherwise the caller gets nullptr and an empty string, which reads as "no error".
     auto* factory = NodeFactory::getInstance();
-    CHECK(factory->registerType("test::AlwaysFails", {},
+    CHECK(factory->registerType("test::AlwaysFails", {}, {},
                                 [](const PropertyBag&, std::string&) -> Node* { return nullptr; }));
 
     std::string error;
@@ -279,6 +279,28 @@ TEST_CASE("camera_declares_field_of_view_as_a_creation_param")
     // camera needs a live director and is covered against the running game instead.
     const auto params = NodeFactory::getInstance()->creationParams("ax::Camera");
     CHECK(std::find(params.begin(), params.end(), "fieldOfView") != params.end());
+}
+
+TEST_CASE("required_creation_params_name_only_what_a_creator_refuses_without")
+{
+    // WHAT A SERIALIZER ASKS BEFORE IT WRITES. Requiredness otherwise lives only inside a creator's
+    // body, where nothing but an actual call can discover it - and calling it to find out means
+    // loading the very asset in question. These lists are what let SceneSerializer notice, without
+    // constructing anything, that a node it is about to write could never be rebuilt.
+    auto* factory = NodeFactory::getInstance();
+
+    CHECK(factory->requiredCreationParams("ax::MeshRenderer") == std::vector<std::string>{"modelPath"});
+    CHECK(factory->requiredCreationParams("ax::Sprite") == std::vector<std::string>{"texturePath"});
+
+    // DECLARED, NOT GUESSED. A texture is optional on a MeshRenderer and a Label's font has a
+    // fallback, so neither belongs here even though both are creation params - which is the whole
+    // distinction between the two lists.
+    CHECK(factory->requiredCreationParams("ax::Label").empty());
+    CHECK(factory->requiredCreationParams("ax::Camera").empty());
+    CHECK(factory->requiredCreationParams("ax::Node").empty());
+
+    // An unregistered type demands nothing, the same way it offers nothing.
+    CHECK(factory->requiredCreationParams("NotARegisteredType").empty());
 }
 
 #endif  // AX_ENABLE_3D

@@ -605,4 +605,69 @@ TEST_CASE("a_mesh_renderer_without_a_model_still_serializes_its_own_children")
 
     CHECK(json.find("authoredChild") != std::string::npos);
 }
+
+TEST_CASE("a_mesh_renderer_built_in_code_is_written_as_a_node_that_can_be_loaded")
+{
+    // THE SAVE THAT COULD NEVER BE READ BACK.
+    //
+    // ax::MeshRenderer is registered, so nothing about the type says it cannot round trip - but its
+    // factory demands a modelPath and refuses an empty one, and a renderer whose geometry was built
+    // in code has no path to report. Writing "modelPath":"" produced a file that saved cleanly,
+    // reported success, and was then refused by every load option there is: allowDegraded covers an
+    // unknown TYPE, and this type is perfectly well known.
+    //
+    // It is now written as the plain marker instead, which is the same answer the depth cap gives
+    // and for the same reason - a marker the loader cannot build is not a degraded file, it is a
+    // broken one.
+    auto* root = MeshRenderer::create();
+    REQUIRE(root != nullptr);
+    REQUIRE(root->getModelPath().empty());
+
+    std::string json;
+    std::string error;
+    std::vector<std::string> saveWarnings;
+    REQUIRE(SceneSerializer::serialize(root, json, error, &saveWarnings));
+
+    CHECK(json.find("\"degraded\":true") != std::string::npos);
+    CHECK(json.find("\"degradedType\":\"ax::MeshRenderer\"") != std::string::npos);
+
+    // The empty path is not written at all. It was never information - it was the absence of it.
+    CHECK(json.find("\"modelPath\":\"\"") == std::string::npos);
+
+    // And the save SAYS so. A file quietly missing a node is the failure this whole marker exists
+    // to avoid.
+    REQUIRE(saveWarnings.size() == 1);
+    CHECK(saveWarnings[0].find("modelPath") != std::string::npos);
+
+    // The point of all of it: it loads. Note the DEFAULT options - no allowDegraded - because a
+    // plain node needs no forgiveness. This is the assertion that used to fail.
+    std::vector<std::string> loadWarnings;
+    Node* loaded = deserializeOrFail(json, loadWarnings);
+    CHECK(loaded != nullptr);
+}
+
+TEST_CASE("a_degraded_mesh_renderer_keeps_its_properties_and_children")
+{
+    // Only the geometry is beyond saving, and it was never in the file to begin with. Everything
+    // that WAS authored - where it sits, what it is called, what hangs off it - has to survive, or
+    // the marker is just a more polite way of dropping the node.
+    auto* root = MeshRenderer::create();
+    REQUIRE(root != nullptr);
+    root->setName("builtInCode");
+    root->setPosition(Vec2(11.0f, 22.0f));
+
+    auto* child = Node::create();
+    child->setName("authoredChild");
+    root->addChild(child);
+
+    std::vector<std::string> warnings;
+    Node* loaded = deserializeOrFail(serializeOrFail(root), warnings);
+    REQUIRE(loaded != nullptr);
+
+    CHECK(loaded->getName() == "builtInCode");
+    CHECK(loaded->getPosition().x == doctest::Approx(11.0f));
+    CHECK(loaded->getPosition().y == doctest::Approx(22.0f));
+    REQUIRE(loaded->getChildrenCount() == 1);
+    CHECK(loaded->getChildren().at(0)->getName() == "authoredChild");
+}
 #endif  // AX_ENABLE_3D
